@@ -128,13 +128,13 @@
     aiEndpoint: 'https://api.openai.com/v1/chat/completions',
     aiModel: 'gpt-4.1-mini',
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
-    narratorVoice: 'zh-CN-XiaoxiaoNeural'
+    narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
 
   const VOICE_POOLS = {
     female: {
       child: ['zh-CN-XiaoshuangNeural'],
-      teen: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoshuangNeural'],
+      teen: ['zh-CN-XiaoyiNeural'],
       young: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaohanNeural'],
       middle: ['zh-CN-XiaomoNeural', 'zh-CN-XiaohanNeural'],
       senior: ['zh-CN-XiaomoNeural', 'zh-CN-XiaoqiuNeural'],
@@ -142,7 +142,7 @@
     },
     male: {
       child: ['zh-CN-YunxiaNeural'],
-      teen: ['zh-CN-YunxiaNeural', 'zh-CN-YunxiNeural'],
+      teen: ['zh-CN-YunxiNeural'],
       young: ['zh-CN-YunxiNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunzeNeural'],
       middle: ['zh-CN-YunzeNeural', 'zh-CN-YunyeNeural', 'zh-CN-YunfengNeural'],
       senior: ['zh-CN-YunyeNeural', 'zh-CN-YunzeNeural'],
@@ -176,7 +176,7 @@
       aiKey: String(info['AI密钥'] || '').trim(),
       aiModel: selectedModel || String(info['AI模型'] || DEFAULTS.aiModel).trim(),
       proxyEndpoint: String(info['TTS中转'] || DEFAULTS.proxyEndpoint).trim(),
-      narratorVoice: String(info['旁白音色'] || DEFAULTS.narratorVoice).trim(),
+      narratorVoice: DEFAULTS.narratorVoice,
       aiEnabled: false
     };
     settings.aiEnabled = (await cache.get('ai_role_enabled')) === 'true';
@@ -469,6 +469,25 @@
     };
   }
 
+  function hasStrictChildEvidence(value) {
+    const text = String(value || '');
+    const number = text.match(/(?:^|\D)(\d{1,2})\s*岁/);
+    if (number && Number(number[1]) <= 12) return true;
+    return /(?:一|二|三|四|五|六|七|八|九|十|十一|十二)岁|婴儿|幼儿|幼童|小学生|儿童|男童|女童|小男孩|小女孩/.test(text);
+  }
+
+  function stabilizeCharacterProfile(profile, line, roster) {
+    const known = roster[profile.speaker];
+    if (known) {
+      if (profile.gender === 'unknown' && known.gender) profile.gender = known.gender;
+      if (profile.age === 'unknown' && known.age) profile.age = known.age;
+    }
+    if (profile.age === 'child' && !(known && known.age === 'child') && !hasStrictChildEvidence(line.age_evidence)) {
+      profile.age = known && known.age ? known.age : 'unknown';
+    }
+    return profile;
+  }
+
   function isChapterHeading(text) {
     return /^\s*(?:第[零一二三四五六七八九十百千万两\d]+[章节回卷]|序章|楔子|尾声|番外)/.test(String(text || ''));
   }
@@ -553,14 +572,14 @@
     const dialogueHistory = chapterMemory.dialogues.slice(-30);
     let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
     const cacheContext = previousProfile ? previousProfile.speaker + '|' + recent.slice(-500) : recent.slice(-500);
-    const cacheKey = 'ai_cast_v4_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v5_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v2'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v3'), {});
     const rosterList = Object.values(roster).slice(-40);
     const prompt = [
       '你是中文小说的配音导演。文本已经被程序严格拆成旁白和对白，旁白无需处理。',
@@ -568,8 +587,10 @@
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
       '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
+      '年龄必须按角色实际年龄判断：child=0至12岁，teen=13至17岁，young=18至35岁，middle=36至59岁，senior=60岁以上。',
+      '必须在 age_evidence 中写出剧情里的年龄依据；没有明确依据就返回 unknown，严禁仅凭语气、称呼别人为孩子或一句话内容判断为 child。',
       '只返回严格 JSON：',
-      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","same_as_previous":false,"confidence":0.0}]}',
+      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
       '本章已读剧情：' + (recent || '无'),
@@ -602,6 +623,7 @@
       for (const item of dialogues) {
         const line = parsed.lines.find(value => Number(value.id) === item.id) || {};
         let profile = normalizeDialogueProfile(line, fallbacks[item.id]);
+        profile = stabilizeCharacterProfile(profile, line, roster);
         profile = keepPreviousSpeaker(profile, line, item, previousProfile, roster);
         profiles[item.id] = profile;
         previousProfile = profile;
@@ -618,7 +640,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v2', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v3', JSON.stringify(roster));
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
       return profiles;
@@ -672,9 +694,8 @@
   }
 
   function pitchFor(profile) {
-    if (profile.age === 'child') return 6;
-    if (profile.age === 'teen') return 3;
-    if (profile.age === 'senior') return -4;
+    if (profile.age === 'child') return 2;
+    if (profile.age === 'senior') return -2;
     return 0;
   }
 
@@ -767,6 +788,9 @@
     }
   }
 
+  // 轻阅时光会并行预取多段；角色分析必须串行，才能可靠继承上一段说话人。
+  let roleAnalysisQueue = Promise.resolve();
+
   // 阅读 App 调用的核心入口，不可删除或改名。
   async function getttsurl(speakText, speechRate) {
     const text = String(speakText || '').trim();
@@ -779,33 +803,38 @@
         await flutterBridge.showToast('AI尚未测试启用，当前使用本地角色判断');
       }
     }
-    const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
-    if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
-      await cache.set('ai_working_notice', 'true');
-      await cache.remove('ai_last_read_error');
-      await flutterBridge.showToast('AI角色识别正在工作');
-    }
-    const rendered = [];
-    let dialogueId = 0;
-
-    for (const segment of segments) {
-      let profile;
-      if (segment.type === 'dialogue') {
-        dialogueId += 1;
-        profile = dialogueProfiles[dialogueId] || {
-          type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown'
-        };
-      } else {
-        profile = {type: 'narrator', speaker: '旁白', gender: 'unknown', age: 'unknown'};
+    const preparation = roleAnalysisQueue.then(async () => {
+      const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
+      if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
+        await cache.set('ai_working_notice', 'true');
+        await cache.remove('ai_last_read_error');
+        await flutterBridge.showToast('AI角色识别正在工作');
       }
-      rendered.push({
-        text: segment.text,
-        profile: profile,
-        voice: await resolveVoice(profile, settings)
-      });
-    }
+      const rendered = [];
+      let dialogueId = 0;
 
-    await updateChapterMemory(text, rendered, dialogueProfiles._source);
+      for (const segment of segments) {
+        let profile;
+        if (segment.type === 'dialogue') {
+          dialogueId += 1;
+          profile = dialogueProfiles[dialogueId] || {
+            type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown'
+          };
+        } else {
+          profile = {type: 'narrator', speaker: '旁白', gender: 'unknown', age: 'unknown'};
+        }
+        rendered.push({
+          text: segment.text,
+          profile: profile,
+          voice: await resolveVoice(profile, settings)
+        });
+      }
+
+      await updateChapterMemory(text, rendered, dialogueProfiles._source);
+      return rendered;
+    });
+    roleAnalysisQueue = preparation.then(() => undefined, () => undefined);
+    const rendered = await preparation;
 
     await flutterBridge.log(
       '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
@@ -826,6 +855,7 @@
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
     await cache.remove('ai_character_roster_v2');
+    await cache.remove('ai_character_roster_v3');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await flutterBridge.showToast('角色和上下文缓存已清空');
