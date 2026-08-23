@@ -1062,6 +1062,8 @@
   let roleBatchTimer = null;
   let activeRoleBatches = 0;
   const rolePreparationInFlight = {};
+  let roleBatchFinalizeTail = Promise.resolve();
+  let lastFinalizedDialogueProfile = null;
 
   function scheduleRolePreparation(text, segments, settings) {
     const requestKey = hashText(text + '|' + aiFingerprint(settings));
@@ -1089,6 +1091,11 @@
     activeRoleBatches += 1;
     // 只合并少量相邻预取段，避免把整章塞给 AI 后变慢或串错角色。
     const batch = pendingRoleBatch.splice(0, MAX_ANALYSIS_BATCH_ITEMS);
+    // AI请求可以并行，但结果必须按原文预取顺序落库，否则后一组看不到上一说话人。
+    const waitForPreviousFinalize = roleBatchFinalizeTail;
+    let finishFinalize;
+    roleBatchFinalizeTail = new Promise(resolve => { finishFinalize = resolve; });
+    let waitedForFinalize = false;
     // 后面的预取段可同时识别，不再排队累计 14、28、42 秒。
     if (pendingRoleBatch.length && !roleBatchTimer &&
       activeRoleBatches < MAX_CONCURRENT_ANALYSIS_BATCHES) {
@@ -1103,6 +1110,8 @@
         combinedSegments.push(...batch[index].segments);
       }
       const dialogueProfiles = await analyzeDialoguesWithAI(combinedText, combinedSegments, batch[0].settings);
+      await waitForPreviousFinalize;
+      waitedForFinalize = true;
       if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
         await cache.set('ai_working_notice', 'true');
         await cache.remove('ai_last_read_error');
@@ -1112,13 +1121,29 @@
       let dialogueId = 0;
       for (const item of batch) {
         const rendered = [];
-        for (const segment of item.segments) {
+        for (let segmentIndex = 0; segmentIndex < item.segments.length; segmentIndex++) {
+          const segment = item.segments[segmentIndex];
           let profile;
           if (segment.type === 'dialogue') {
             dialogueId += 1;
             profile = dialogueProfiles[dialogueId] || {
               type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown', emotion: 'neutral', intensity: 0.3
             };
+            const before = item.segments[segmentIndex - 1];
+            const after = item.segments[segmentIndex + 1];
+            const boundaryContext = {
+              before: before && before.type === 'narrator' ? before.text : '',
+              after: after && after.type === 'narrator' ? after.text : ''
+            };
+            if (lastFinalizedDialogueProfile && !hasSpeakerCue(boundaryContext)) {
+              profile = {
+                ...profile,
+                speaker: lastFinalizedDialogueProfile.speaker,
+                gender: lastFinalizedDialogueProfile.gender,
+                age: lastFinalizedDialogueProfile.age
+              };
+            }
+            lastFinalizedDialogueProfile = profile;
           } else {
             profile = {
               type: 'narrator', speaker: '旁白', gender: 'male', age: 'young',
@@ -1135,8 +1160,10 @@
         item.resolve(rendered);
       }
     } catch (error) {
+      if (!waitedForFinalize) await waitForPreviousFinalize;
       batch.forEach(item => item.reject(error));
     } finally {
+      finishFinalize();
       activeRoleBatches -= 1;
       if (pendingRoleBatch.length && !roleBatchTimer) {
         roleBatchTimer = setTimeout(flushRoleBatch, 0);
@@ -1174,6 +1201,7 @@
   }
 
   async function clearRoleCache() {
+    lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
     await cache.remove('ai_character_roster_v2');
