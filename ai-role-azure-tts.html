@@ -395,6 +395,82 @@
     await flutterBridge.showToast(lines.join('\n'));
   }
 
+  // 导出完整诊断日志（复制发给开发者排查）。含配置状态、成败统计、
+  // 最近错误、AI原始返回、角色表与音色表。不包含完整密钥。
+  async function exportDebugLog() {
+    const settings = await readSettings();
+    const enabled = await cache.get('ai_role_enabled');
+    const status = await cache.get('ai_last_status');
+    const lastError = await cache.get('ai_last_read_error');
+    const rawPreview = await cache.get('ai_last_raw_preview');
+    const stats = parseObject(await cache.get('ai_run_stats'), {ok: 0, timeout: 0});
+    const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
+    const narrator = await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice;
+    const uiMode = await cache.get('ai_ui_mode') || 'settings';
+    const endpoint = settings.aiEndpoint || DEFAULTS.aiEndpoint;
+
+    const parts = [];
+    parts.push('===== 福尼亚朗读引擎诊断 =====');
+    parts.push('引擎版本: v2026-08-24  (缓存 v12/v9/v9)');
+    parts.push('AI启用: ' + (enabled === 'true' ? '是' : '否'));
+    parts.push('AI接口: ' + endpoint);
+    parts.push('AI模型: ' + (settings.aiModel || '未选择'));
+    parts.push('AI密钥: ' + (settings.aiKey ? '已填(尾号' + settings.aiKey.slice(-4) + ')' : '未填'));
+    parts.push('近2分钟: 成功' + (stats.ok || 0) + '次 / 超时' + (stats.timeout || 0) + '次');
+    if (status) parts.push('状态: ' + status);
+    if (lastError) parts.push('最近错误: ' + lastError);
+    if (rawPreview) parts.push('AI原始返回: ' + rawPreview);
+    parts.push('界面模式: ' + uiMode + '  旁白音色: ' + narrator);
+    parts.push('---- 角色表(共' + Object.keys(roster).length + ') ----');
+    const rosterNames = Object.keys(roster).filter(k => roster[k] && roster[k].speaker);
+    parts.push(rosterNames.length
+      ? rosterNames.map(k => roster[k].speaker + '=' + (roster[k].gender || '?') + '/' + (roster[k].age || '?')).join('；')
+      : '(空)');
+    parts.push('---- 音色表(共' + Object.keys(voiceMap).length + ') ----');
+    const vKeys = Object.keys(voiceMap).filter(k => k !== '__narrator__');
+    parts.push(vKeys.length
+      ? vKeys.map(k => {
+          const e = voiceMap[k];
+          const v = typeof e === 'string' ? e : (e && e.voice);
+          return k + '→' + (v ? v.replace('zh-CN-', '').replace('Neural', '') : '无') + (e && e.override ? '(手动)' : '');
+        }).join('；')
+      : '(空)');
+    const log = parts.join('\n');
+    await cache.set('ai_debug_log', log);
+    await flutterBridge.showToast('诊断日志已生成。点【复制诊断日志】把内容发给开发者排查。');
+    return log;
+  }
+
+  // 生成诊断日志查看面板（逐行显示，便于查看/复制）。
+  async function showDebugLogUI() {
+    let log = await cache.get('ai_debug_log');
+    if (!log) log = await exportDebugLog();
+    const ui = [
+      {name: '诊断日志', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}},
+      {name: '重新生成', type: 'button', action: 'exportDebugLog()', style: {layout_flexBasisPercent: 0.5}},
+      {name: '返回设置', type: 'button', action: 'closeDebugLog()', style: {layout_flexBasisPercent: 0.5}}
+    ];
+    const lines = String(log || '').split('\n');
+    for (const line of lines) {
+      ui.push({name: line, type: 'text'});
+    }
+    return JSON.stringify(ui);
+  }
+
+  async function closeDebugLog() {
+    await cache.remove('ai_ui_mode');
+    await flutterBridge.showToast('已返回设置面板');
+    return 'ok';
+  }
+
+  async function openDebugLog() {
+    await exportDebugLog();
+    await cache.set('ai_ui_mode', 'debug');
+    await flutterBridge.showToast('正在生成诊断日志，请重新打开设置面板查看');
+    return 'ok';
+  }
+
   async function testAndEnableAI() {
     const settings = await readSettings();
     if (!settings.aiEndpoint || !settings.aiKey || !settings.aiModel) {
@@ -691,9 +767,18 @@
     }
     // 兼容“姓名+动作+：”引出引号（如“张羽垂着眼：”“白真真抬起头：”）。
     if (!speaker || speaker === '未命名角色') {
-      const colonMatch = value.match(/([\u4e00-\u9fa5]{2,4})(?:垂着眼|笑了笑|点了点头|叹了口气|顿了顿|皱皱眉|抬起头|看向|看着他|看着她|看过来|回过神)[，。、\s]*[:：]/);
+      const colonMatch = value.match(/([\u4e00-\u9fa5]{2,4})(?:垂着眼|笑了笑|点了点头|叹了口气|顿了顿|皱皱眉|抬起头|看向|看着他|看着她|看过来|回过神|低声道)[，。、\s]*[:：]/);
       if (colonMatch && !speechAdverb.test(colonMatch[1]) && sanitizeSpeaker(colonMatch[1]) !== '未命名角色') {
         speaker = colonMatch[1];
+      }
+    }
+    // 叙述句里的人物名主语（如“服用了亢奋剂的张羽此刻……”“张羽一跃而出”），
+    // 后面往往紧接此人的台词。取结尾处“姓名+行动/状态”的名作为说话人。
+    if (!speaker || speaker === '未命名角色') {
+      const subjectMatch = value.match(/([\u4e00-\u9fa5]{2,4})(?:此刻|此时|已经|连忙|随即|便|也|正在|一边|率先|当即|一个箭步|一跃而出|闪身|冷冷地|当即|此时已经)[^。！？；，\s]{0,6}[\s，。]*$/);
+      if (subjectMatch && !speechAdverb.test(subjectMatch[1]) &&
+        sanitizeSpeaker(subjectMatch[1]) !== '未命名角色') {
+        speaker = subjectMatch[1];
       }
     }
     if (/解释|回应|补充|电话|一头|接着|继续/.test(speaker)) return '未命名角色';
@@ -1543,8 +1628,12 @@
 
   async function getloginurl() {
     // 音色管理模式：getloginurl 渲染音色管理面板而非设置面板。
-    if ((await cache.get('ai_ui_mode')) === 'voices') {
+    const mode = await cache.get('ai_ui_mode');
+    if (mode === 'voices') {
       return buildVoiceManagerUI();
+    }
+    if (mode === 'debug') {
+      return showDebugLogUI();
     }
     const models = parseObject(await cache.get('ai_model_list'), []);
     const info = parseObject(await cache.getLoginInfo(), {});
@@ -1568,7 +1657,8 @@
       {name: '状态/当前模型', type: 'button', action: 'showAiStatus()', style: {layout_flexBasisPercent: 0.34}},
       {name: '停用AI', type: 'button', action: 'setAiEnabled(false)', style: {layout_flexBasisPercent: 0.33}},
       {name: '音色管理', type: 'button', action: 'openVoiceManager()', style: {layout_flexBasisPercent: 0.34}},
-      {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}}
+      {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}},
+      {name: '诊断日志', type: 'button', action: 'openDebugLog()', style: {layout_flexBasisPercent: 0.34}}
     ];
     for (const model of models.slice(0, 30)) {
       ui.push({
@@ -1597,6 +1687,10 @@
   window.openVoiceManager = openVoiceManager;
   window.closeVoiceManager = closeVoiceManager;
   window.switchVoice = switchVoice;
+  window.openDebugLog = openDebugLog;
+  window.exportDebugLog = exportDebugLog;
+  window.showDebugLogUI = showDebugLogUI;
+  window.closeDebugLog = closeDebugLog;
   window.resetVoice = resetVoice;
   window.switchNarratorVoice = switchNarratorVoice;
 </script>
