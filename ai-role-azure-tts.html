@@ -406,6 +406,7 @@
     const stats = parseObject(await cache.get('ai_run_stats'), {ok: 0, timeout: 0});
     const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
     const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
+    const eventLog = parseObject(await cache.get('ai_event_log'), []);
     const narrator = await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice;
     const uiMode = await cache.get('ai_ui_mode') || 'settings';
     const endpoint = settings.aiEndpoint || DEFAULTS.aiEndpoint;
@@ -436,6 +437,12 @@
           return k + '→' + (v ? v.replace('zh-CN-', '').replace('Neural', '') : '无') + (e && e.override ? '(手动)' : '');
         }).join('；')
       : '(空)');
+    parts.push('---- 运行流水(最近' + (Array.isArray(eventLog) ? eventLog.length : 0) + '条) ----');
+    if (Array.isArray(eventLog) && eventLog.length) {
+      parts.push(eventLog.join('\n'));
+    } else {
+      parts.push('(暂无运行记录，朗读一段后再导出)');
+    }
     const log = parts.join('\n');
     await cache.set('ai_debug_log', log);
     await flutterBridge.showToast('诊断日志已生成。点【复制诊断日志】把内容发给开发者排查。');
@@ -1019,8 +1026,10 @@
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
+      await appLog('命中AI缓存(' + cacheKey.slice(0, 12) + ')，直接使用已识别结果');
       return cached;
     }
+    await appLog('未命中缓存，发起AI分析(共' + dialogues.length + '句对白)');
 
     const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
@@ -1127,10 +1136,12 @@
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
       await bumpAiStat('ok');
+      await appLog('AI分析成功，已识别 ' + Object.keys(profiles || {}).filter(k => !k.startsWith('_')).length + ' 句');
       return profiles;
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
       await bumpAiStat('timeout');
+      await appLog('AI分析失败/超时 → 改用本地判断，错误：' + error.message);
       if (lastRawContent) await cache.set('ai_last_raw_preview', lastRawContent.slice(0, 500));
       await cache.set('ai_last_status', 'AI较慢，已沿用角色记忆');
       const lastError = await cache.get('ai_last_read_error');
@@ -1140,6 +1151,16 @@
       }
       return fallbacks;
     }
+  }
+
+// 追加一条带时间戳的滚动运行日志（保留最近 60 条），用于导出诊断。
+  async function appLog(message) {
+    try {
+      const list = parseObject(await cache.get('ai_event_log'), []);
+      const stamp = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+      list.push('[' + stamp + '] ' + message);
+      await cache.set('ai_event_log', JSON.stringify(list.slice(-60)));
+    } catch (e) {}
   }
 
   // 累计 AI 成功/超时次数（2 分钟内滚动），用于诊断接口是否稳定。
@@ -1545,6 +1566,11 @@
             profile: profile,
             voice: await resolveVoice(profile, item.settings)
           });
+          if (segment.type === 'dialogue' && profile.speaker) {
+            const voiceShort = String(rendered[rendered.length - 1].voice || '').replace('zh-CN-', '').replace('Neural', '');
+            await appLog('配音 ' + profile.speaker + '/' + (profile.gender || '?') + ' → ' + voiceShort + '："' +
+              String(segment.text).slice(0, 12) + '…"(来源' + dialogueProfiles._source + ')');
+          }
         }
         await updateChapterMemory(item.text, rendered, dialogueProfiles._source);
         item.resolve(rendered);
@@ -1574,6 +1600,9 @@
       }
     }
     const rendered = await scheduleRolePreparation(text, segments, settings);
+
+    await appLog('朗读调用：AI=' + (settings.aiEnabled ? '开' : '关') + '，对白' +
+      segments.filter(s => s.type === 'dialogue').length + '句');
 
     await flutterBridge.log(
       '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
