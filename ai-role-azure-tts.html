@@ -133,26 +133,26 @@
 
   const VOICE_POOLS = {
     female: {
-      child: ['zh-CN-XiaoyouNeural', 'zh-CN-XiaoshuangNeural'],
-      teen: ['zh-CN-XiaoshuangNeural', 'zh-CN-XiaoyiNeural'],
-      young: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaochenNeural', 'zh-CN-XiaomengNeural'],
-      middle: ['zh-CN-XiaohanNeural', 'zh-CN-XiaomoNeural', 'zh-CN-XiaorouNeural', 'zh-CN-XiaoyanNeural'],
-      senior: ['zh-CN-XiaoqiuNeural', 'zh-CN-XiaozhenNeural'],
-      unknown: ['zh-CN-XiaoxiaoNeural', 'zh-CN-XiaohanNeural']
+      child: ['zh-CN-XiaoshuangNeural'],
+      teen: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoshuangNeural'],
+      young: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaohanNeural'],
+      middle: ['zh-CN-XiaomoNeural', 'zh-CN-XiaohanNeural'],
+      senior: ['zh-CN-XiaomoNeural', 'zh-CN-XiaoqiuNeural'],
+      unknown: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaohanNeural']
     },
     male: {
       child: ['zh-CN-YunxiaNeural'],
       teen: ['zh-CN-YunxiaNeural', 'zh-CN-YunxiNeural'],
-      young: ['zh-CN-YunxiNeural', 'zh-CN-YunhaoNeural', 'zh-CN-YunxiaNeural'],
-      middle: ['zh-CN-YunjianNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunzeNeural'],
-      senior: ['zh-CN-YunyeNeural', 'zh-CN-YunyangNeural'],
-      unknown: ['zh-CN-YunxiNeural', 'zh-CN-YunjianNeural']
+      young: ['zh-CN-YunxiNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunzeNeural'],
+      middle: ['zh-CN-YunzeNeural', 'zh-CN-YunyeNeural', 'zh-CN-YunfengNeural'],
+      senior: ['zh-CN-YunyeNeural', 'zh-CN-YunzeNeural'],
+      unknown: ['zh-CN-YunxiNeural', 'zh-CN-YunzeNeural']
     },
     unknown: {
       child: ['zh-CN-XiaoyouNeural', 'zh-CN-YunxiaNeural'],
       teen: ['zh-CN-XiaoshuangNeural', 'zh-CN-YunxiaNeural'],
-      young: ['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural'],
-      middle: ['zh-CN-XiaohanNeural', 'zh-CN-YunjianNeural'],
+      young: ['zh-CN-XiaoyiNeural', 'zh-CN-YunxiNeural'],
+      middle: ['zh-CN-XiaomoNeural', 'zh-CN-YunzeNeural'],
       senior: ['zh-CN-XiaoqiuNeural', 'zh-CN-YunyeNeural'],
       unknown: ['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural']
     }
@@ -469,6 +469,65 @@
     };
   }
 
+  function isChapterHeading(text) {
+    return /^\s*(?:第[零一二三四五六七八九十百千万两\d]+[章节回卷]|序章|楔子|尾声|番外)/.test(String(text || ''));
+  }
+
+  async function readChapterMemory(text) {
+    let memory = parseObject(await cache.get('ai_chapter_memory_v3'), {});
+    if (!memory || typeof memory !== 'object' || isChapterHeading(text)) memory = {};
+    return {
+      text: String(memory.text || '').slice(-30000),
+      dialogues: Array.isArray(memory.dialogues) ? memory.dialogues.slice(-80) : []
+    };
+  }
+
+  function hasSpeakerCue(item) {
+    const context = String(item.before || '') + ' ' + String(item.after || '');
+    return /(?:说|问|喊|答|叫|道|解释|回应|补充|嘀咕|叹气|开口|接着|继续)/.test(context);
+  }
+
+  function isGenericSpeaker(speaker) {
+    return /^(?:未命名角色|男性角色|女性角色|说话人|男人|女人|男子|女子|男孩|女孩|他|她|角色\d*)$/.test(String(speaker || ''));
+  }
+
+  function keepPreviousSpeaker(profile, line, item, previousProfile, roster) {
+    if (!previousProfile || hasSpeakerCue(item)) return profile;
+    const sameAsPrevious = line.same_as_previous;
+    const namedInsideDialogue = profile.speaker && String(item.text || '').includes(profile.speaker) &&
+      !/(?:我是|我叫|名字叫)/.test(String(item.text || ''));
+    const unknownNewSpeaker = profile.speaker && profile.speaker !== previousProfile.speaker && !roster[profile.speaker];
+    const shouldContinue = sameAsPrevious === true || namedInsideDialogue ||
+      (sameAsPrevious !== false && (isGenericSpeaker(profile.speaker) || namedInsideDialogue || unknownNewSpeaker));
+    if (!shouldContinue) return profile;
+    return {
+      type: 'dialogue',
+      speaker: previousProfile.speaker,
+      gender: previousProfile.gender,
+      age: previousProfile.age,
+      confidence: Math.max(Number(profile.confidence || 0), Number(previousProfile.confidence || 0))
+    };
+  }
+
+  async function updateChapterMemory(text, rendered, source) {
+    const memory = await readChapterMemory(text);
+    const value = String(text || '').trim();
+    if (value && !memory.text.endsWith(value)) memory.text = (memory.text + '\n' + value).trim().slice(-30000);
+    if (source === 'ai') {
+      for (const item of rendered) {
+        if (item.profile.type !== 'dialogue') continue;
+        memory.dialogues.push({
+          speaker: item.profile.speaker,
+          gender: item.profile.gender,
+          age: item.profile.age,
+          text: item.text
+        });
+      }
+      memory.dialogues = memory.dialogues.slice(-80);
+    }
+    await cache.set('ai_chapter_memory_v3', JSON.stringify(memory));
+  }
+
   async function analyzeDialoguesWithAI(text, segments, settings) {
     const dialogues = [];
     const fallbacks = {};
@@ -489,25 +548,32 @@
     fallbacks._source = 'local';
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
-    const cacheKey = 'ai_cast_v2_' + hashText(text);
+    const chapterMemory = await readChapterMemory(text);
+    const recent = chapterMemory.text.slice(-16000);
+    const dialogueHistory = chapterMemory.dialogues.slice(-30);
+    let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
+    const cacheContext = previousProfile ? previousProfile.speaker + '|' + recent.slice(-500) : recent.slice(-500);
+    const cacheKey = 'ai_cast_v4_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const recent = String((await cache.get('ai_recent_context')) || '').slice(-1000);
     const roster = parseObject(await cache.get('ai_character_roster_v2'), {});
     const rosterList = Object.values(roster).slice(-40);
     const prompt = [
       '你是中文小说的配音导演。文本已经被程序严格拆成旁白和对白，旁白无需处理。',
       '请判断每条对白是谁说的，并推断性别和年龄层。相同角色必须始终使用完全相同的 speaker 名称。',
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
+      '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
+      '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
       '只返回严格 JSON：',
-      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","confidence":0.0}]}',
+      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
-      '最近前文：' + (recent || '无'),
+      '本章已读剧情：' + (recent || '无'),
+      '最近已确认的对白角色：' + JSON.stringify(dialogueHistory),
       '当前段落：' + String(text || '').slice(0, 2600),
       '待识别对白：' + JSON.stringify(dialogues.map(item => ({
         id: item.id,
@@ -535,8 +601,10 @@
       const profiles = {};
       for (const item of dialogues) {
         const line = parsed.lines.find(value => Number(value.id) === item.id) || {};
-        const profile = normalizeDialogueProfile(line, fallbacks[item.id]);
+        let profile = normalizeDialogueProfile(line, fallbacks[item.id]);
+        profile = keepPreviousSpeaker(profile, line, item, previousProfile, roster);
         profiles[item.id] = profile;
+        previousProfile = profile;
         if (profile.speaker && profile.speaker !== '未命名角色') {
           roster[profile.speaker] = {
             speaker: profile.speaker,
@@ -575,7 +643,7 @@
   async function resolveVoice(profile, settings) {
     if (profile.type !== 'dialogue') return settings.narratorVoice;
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v2'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v3'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
@@ -593,7 +661,7 @@
       }
     }
     voiceMap[identity] = voice;
-    await cache.set('ai_speaker_voice_map_v2', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v3', JSON.stringify(voiceMap));
     return voice;
   }
 
@@ -604,9 +672,9 @@
   }
 
   function pitchFor(profile) {
-    if (profile.age === 'child') return 18;
-    if (profile.age === 'teen') return 8;
-    if (profile.age === 'senior') return -12;
+    if (profile.age === 'child') return 6;
+    if (profile.age === 'teen') return 3;
+    if (profile.age === 'senior') return -4;
     return 0;
   }
 
@@ -737,8 +805,7 @@
       });
     }
 
-    const recent = String((await cache.get('ai_recent_context')) || '');
-    await cache.set('ai_recent_context', (recent + '\n' + text).slice(-1000));
+    await updateChapterMemory(text, rendered, dialogueProfiles._source);
 
     await flutterBridge.log(
       '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
@@ -757,8 +824,10 @@
 
   async function clearRoleCache() {
     await cache.remove('ai_speaker_voice_map_v2');
+    await cache.remove('ai_speaker_voice_map_v3');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_recent_context');
+    await cache.remove('ai_chapter_memory_v3');
     await flutterBridge.showToast('角色和上下文缓存已清空');
   }
 
