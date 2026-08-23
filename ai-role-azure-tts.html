@@ -170,16 +170,16 @@
 
   async function readSettings() {
     const info = parseObject(await cache.getLoginInfo(), {});
+    const selectedModel = String((await cache.get('ai_selected_model')) || '').trim();
     const settings = {
       aiEndpoint: String(info['AI接口'] || DEFAULTS.aiEndpoint).trim(),
       aiKey: String(info['AI密钥'] || '').trim(),
-      aiModel: String(info['AI模型'] || DEFAULTS.aiModel).trim(),
+      aiModel: selectedModel || String(info['AI模型'] || DEFAULTS.aiModel).trim(),
       proxyEndpoint: String(info['TTS中转'] || DEFAULTS.proxyEndpoint).trim(),
       narratorVoice: String(info['旁白音色'] || DEFAULTS.narratorVoice).trim(),
       aiEnabled: false
     };
-    settings.aiEnabled = (await cache.get('ai_role_enabled')) === 'true' &&
-      (await cache.get('ai_valid_fingerprint')) === aiFingerprint(settings);
+    settings.aiEnabled = (await cache.get('ai_role_enabled')) === 'true';
     return settings;
   }
 
@@ -278,7 +278,14 @@
 
       await cache.set('ai_model_list', JSON.stringify(models));
       const info = parseObject(await cache.getLoginInfo(), {});
-      if (!models.includes(String(info['AI模型'] || ''))) info['AI模型'] = models[0];
+      const selectedModel = String((await cache.get('ai_selected_model')) || info['AI模型'] || '');
+      if (!models.includes(selectedModel)) {
+        info['AI模型'] = models[0];
+        await cache.set('ai_selected_model', models[0]);
+      } else {
+        info['AI模型'] = selectedModel;
+        await cache.set('ai_selected_model', selectedModel);
+      }
       await cache.putLoginInfo(JSON.stringify(info));
       await flutterBridge.showToast('获取到 ' + models.length + ' 个模型，重新打开设置即可选择');
     } catch (error) {
@@ -291,6 +298,7 @@
     const info = parseObject(await cache.getLoginInfo(), {});
     info['AI模型'] = model;
     await cache.putLoginInfo(JSON.stringify(info));
+    await cache.set('ai_selected_model', model);
     await cache.set('ai_role_enabled', 'false');
     await cache.set('ai_last_status', '模型已选择，尚未测试');
     await flutterBridge.showToast('已选择模型：' + model);
@@ -325,9 +333,10 @@
       });
       const parsed = parseObject(stripJsonFence(content), null);
       if (!parsed) throw new Error('模型未返回 JSON');
-      await cache.set('ai_valid_fingerprint', aiFingerprint(settings));
       await cache.set('ai_role_enabled', 'true');
       await cache.remove('ai_disabled_notice');
+      await cache.remove('ai_working_notice');
+      await cache.remove('ai_last_read_error');
       await cache.set('ai_last_status', '连接测试成功');
       await flutterBridge.showToast('AI连接成功，角色识别已启用');
     } catch (error) {
@@ -477,11 +486,15 @@
     });
 
     if (!dialogues.length) return {};
+    fallbacks._source = 'local';
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
     const cacheKey = 'ai_cast_v2_' + hashText(text);
     const cached = parseObject(await cache.get(cacheKey), null);
-    if (cached) return cached;
+    if (cached) {
+      cached._source = 'ai';
+      return cached;
+    }
 
     const recent = String((await cache.get('ai_recent_context')) || '').slice(-1000);
     const roster = parseObject(await cache.get('ai_character_roster_v2'), {});
@@ -538,10 +551,17 @@
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
       await cache.set('ai_character_roster_v2', JSON.stringify(roster));
+      profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
       return profiles;
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
+      await cache.set('ai_last_status', '朗读识别失败：' + error.message);
+      const lastError = await cache.get('ai_last_read_error');
+      if (lastError !== error.message) {
+        await cache.set('ai_last_read_error', error.message);
+        await flutterBridge.showToast('AI识别失败，已改用本地：' + error.message);
+      }
       return fallbacks;
     }
   }
@@ -692,6 +712,11 @@
       }
     }
     const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
+    if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
+      await cache.set('ai_working_notice', 'true');
+      await cache.remove('ai_last_read_error');
+      await flutterBridge.showToast('AI角色识别正在工作');
+    }
     const rendered = [];
     let dialogueId = 0;
 
@@ -724,8 +749,8 @@
   async function setAiEnabled(enabled) {
     await cache.set('ai_role_enabled', enabled ? 'true' : 'false');
     if (!enabled) {
-      await cache.remove('ai_valid_fingerprint');
       await cache.remove('ai_disabled_notice');
+      await cache.remove('ai_working_notice');
     }
     await flutterBridge.showToast(enabled ? '请使用“测试并启用AI”' : '已停用 AI，改用本地判断');
   }
@@ -741,7 +766,7 @@
   async function getloginurl() {
     const models = parseObject(await cache.get('ai_model_list'), []);
     const info = parseObject(await cache.getLoginInfo(), {});
-    const currentModel = String(info['AI模型'] || DEFAULTS.aiModel);
+    const currentModel = String((await cache.get('ai_selected_model')) || info['AI模型'] || DEFAULTS.aiModel);
     const ui = [
       {name: 'AI接口', type: 'text'},
       {name: 'AI密钥', type: 'password'},
@@ -763,15 +788,7 @@
     return JSON.stringify(ui);
   }
 
-  async function login() {
-    const settings = await readSettings();
-    const valid = await cache.get('ai_valid_fingerprint');
-    if (valid && valid !== aiFingerprint(settings)) {
-      await cache.set('ai_role_enabled', 'false');
-      await cache.remove('ai_disabled_notice');
-      await cache.set('ai_last_status', '接口、密钥或模型已修改，请重新测试');
-    }
-  }
+  async function login() {}
 
   // 显式挂到 window，兼容使用反射查找入口函数的阅读 App WebView。
   window.getttsurl = getttsurl;
