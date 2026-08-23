@@ -246,9 +246,17 @@
     if (!response || Number(response.statusCode || 200) >= 400) {
       throw new Error(responseError(response, payload));
     }
-    const content = payload.choices && payload.choices[0] && payload.choices[0].message
-      ? payload.choices[0].message.content
-      : payload.output_text;
+    const message = payload.choices && payload.choices[0] && payload.choices[0].message;
+    let content = message
+      ? (message.content || message.text || message.output_text)
+      : (payload.output_text || payload.content || payload.text || payload.response);
+    if (Array.isArray(content)) {
+      content = content.map(item => typeof item === 'string'
+        ? item
+        : item && (item.text || item.content || item.value) || '').filter(Boolean).join('\n');
+    } else if (content && typeof content === 'object') {
+      content = JSON.stringify(content);
+    }
     if (!content) throw new Error(responseError(response, payload));
     return content;
   }
@@ -382,6 +390,15 @@
   }
 
   function parseAiPayload(content) {
+    if (content && typeof content === 'object' && !Array.isArray(content)) return content;
+    if (Array.isArray(content)) {
+      const blocks = content.map(item => {
+        if (typeof item === 'string') return item;
+        return item && (item.text || item.content || item.value) || '';
+      }).filter(Boolean);
+      if (blocks.length) content = blocks.join('\n');
+      else return content;
+    }
     let raw = String(content || '').trim();
     const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
     if (fenced) raw = fenced[1].trim();
@@ -389,17 +406,51 @@
       return JSON.parse(raw);
     } catch (error) {}
 
-    const objectStart = raw.indexOf('{');
-    const arrayStart = raw.indexOf('[');
-    const useArray = arrayStart >= 0 && (objectStart < 0 || arrayStart < objectStart);
-    const start = useArray ? arrayStart : objectStart;
-    const end = useArray ? raw.lastIndexOf(']') : raw.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      try {
-        return JSON.parse(raw.slice(start, end + 1));
-      } catch (error) {}
+    const candidates = [];
+    let start = -1;
+    let stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < raw.length; index++) {
+      const char = raw[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === '{' || char === '[') {
+        if (!stack.length) start = index;
+        stack.push(char);
+      } else if ((char === '}' || char === ']') && stack.length) {
+        const opener = stack[stack.length - 1];
+        if ((opener === '{' && char === '}') || (opener === '[' && char === ']')) stack.pop();
+        else {
+          stack = [];
+          start = -1;
+          continue;
+        }
+        if (!stack.length && start >= 0) {
+          try {
+            candidates.push(JSON.parse(raw.slice(start, index + 1)));
+          } catch (error) {}
+          start = -1;
+        }
+      }
     }
-    return null;
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const candidate = candidates[index];
+      if (Array.isArray(candidate)) return candidate;
+      if (candidate && typeof candidate === 'object') {
+        if (candidate.lines || candidate.dialogues || candidate.results || candidate.items ||
+          candidate.data || candidate.result || candidate.analysis || candidate.output) return candidate;
+      }
+    }
+    return candidates.length ? candidates[candidates.length - 1] : null;
   }
 
   function normalizeAiAnalysis(payload) {
@@ -728,12 +779,36 @@
     };
 
     try {
-      const content = await withTimeout(
-        requestAiChat(settings, body),
+      const parsed = await withTimeout(
+        (async () => {
+          let content = await requestAiChat(settings, body);
+          let analysis = normalizeAiAnalysis(parseAiPayload(content));
+          if (analysis && analysis.lines.length) return analysis;
+
+          await flutterBridge.log('AI首次返回格式异常，自动进行极简重试：' + String(content || '').slice(0, 300));
+          const retryBody = {
+            model: settings.aiModel,
+            temperature: 0,
+            max_tokens: Math.min(1800, Math.max(600, dialogues.length * 180)),
+            response_format: {type: 'json_object'},
+            messages: [
+              {role: 'system', content: '只输出一个JSON对象，禁止解释、Markdown和思考过程。'},
+              {role: 'user', content: [
+                '识别下列小说对白的speaker、gender、age、emotion。',
+                '严格返回：{"lines":[{"id":1,"speaker":"角色","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"依据或无","emotion":"neutral|calm|happy|sad|angry|nervous|excited|serious|tender","intensity":0.3,"same_as_previous":false}]}',
+                '上一说话人：' + (previousProfile ? JSON.stringify(previousProfile) : '无'),
+                '角色表：' + JSON.stringify(rosterList.slice(-20)),
+                '对白：' + JSON.stringify(dialogues.map(item => ({id: item.id, before: item.before, text: item.text, after: item.after})))
+              ].join('\n')}
+            ]
+          };
+          content = await requestAiChat(settings, retryBody);
+          analysis = normalizeAiAnalysis(parseAiPayload(content));
+          return analysis;
+        })(),
         AI_ANALYSIS_TIMEOUT,
         'AI分析超过15秒'
       );
-      const parsed = normalizeAiAnalysis(parseAiPayload(content));
       if (!parsed || !parsed.lines.length) throw new Error('AI返回格式无法识别');
 
       const profiles = {};
