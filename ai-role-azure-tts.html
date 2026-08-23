@@ -131,6 +131,7 @@
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
   const AI_ANALYSIS_TIMEOUT = 16000;
+const AI_MAX_RETRIES = 2;
   const ANALYSIS_BATCH_DELAY = 15;
   const MAX_ANALYSIS_BATCH_ITEMS = 3;
   const MAX_CONCURRENT_ANALYSIS_BATCHES = 3;
@@ -1031,40 +1032,35 @@
     const knownCount = Object.keys(roster).filter(k => roster[k] && roster[k].speaker).length;
     await appLog('未命中缓存，发起AI分析(共' + dialogues.length + '句，携带已知角色' + knownCount + '个)');
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
-    const rosterList = Object.values(roster).slice(-12).map(item => ({
+    const rosterList = Object.values(roster).slice(-8).map(item => ({
       speaker: item.speaker,
       gender: item.gender,
       age: item.age
     }));
-    const compactHistory = dialogueHistory.slice(-6).map(item => ({
+    const compactHistory = dialogueHistory.slice(-4).map(item => ({
       speaker: item.speaker,
       gender: item.gender,
       age: item.age,
-      text: String(item.text || '').slice(0, 80)
+      text: String(item.text || '').slice(0, 40)
     }));
     const prompt = [
-      '你是中文小说配音助手，只分析当前几个相邻小段，不做整章分析。旁白无需分配角色。',
-      '请判断每条对白是谁说的，并推断性别、年龄层和当前情绪。相同角色必须使用相同 speaker 名称。',
-      '性别判断规则：优先使用上下文线索（他/她、称谓等）；上下文没有明确线索时，可根据姓名本身判断大概率性别（例如“白真真”“李婉婷”大概率是女性，“王铁柱”“张建国”大概率是男性），此时在 gender_evidence 中写“姓名推测”；姓名无明显性别倾向或纯属代称时才返回 unknown。',
-      '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
-      '能确定是谁在说话就给出具体角色名（优先用“已有角色表”里的名字）；只有完全无法从上下文判断时才用“未命名角色”。若对话与上一句或已知角色明显衔接，应沿用该角色而非新建“未命名角色”。',
-      '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
-      '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
-      '原文不一定会写“某某说”。即使没有说/道等动词，也要结合上下文（谁在场、上一句是谁、动作与剧情）推断本句是谁说的，并在对应 speaker 上给出该角色的性别。只要说话人是确定角色（如张羽），gender 就必须与该角色一致，严禁沿袭上一句不同角色的性别。',
-      '年龄必须按角色实际年龄判断：child=0至12岁，teen=13至17岁，young=18至35岁，middle=36至59岁，senior=60岁以上。',
-      '必须在 age_evidence 中写出剧情里的年龄依据；没有明确依据就返回 unknown，严禁仅凭语气、称呼别人为孩子或一句话内容判断为 child。',
-      '同时判断本段旁白氛围和每条对白的情绪。emotion 只能是 neutral|calm|happy|sad|angry|nervous|excited|serious|tender，intensity 为0到1；不确定时使用 neutral 和0.3，禁止夸张。',
-      '只返回严格 JSON：',
-      '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","gender_evidence":"原文依据或姓名推测或无","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
+      '你是小说配音助手，判断每条对白是谁说的，给出性别/年龄层/情绪。相同角色用相同speaker。',
+      '性别尽量判断：优先用上下文(他/她/称谓)，没有则按姓名特征推测(如"白真真"像女)；实在看不出才unknown。',
+      '优先复用"已有角色表"里的名字；原文无姓名可用稳定称呼(母亲/少年/店主)。能确定是谁就说具体角色名，只有完全无法判断才用"未命名角色"。',
+      '对白里提到的人名不一定是说话人(如"张羽没有训练")。连续多段引号同一人说时same_as_previous=true并沿用；无"说/道"词也要结合上下文推断说话人，并沿用该角色性别。',
+      '年龄: child≤12, teen13-17, young18-35, middle36-59, senior60+；无依据unknown。',
+      '情绪只从 neutral|calm|happy|sad|angry|nervous|excited|serious|tender 选，intensity 0-1，拿不准用 neutral/0.3。',
+      '只返回严格JSON：',
+      '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或称呼","gender":"male|female|unknown","gender_evidence":"依据(可省)","age":"child|teen|young|middle|senior|unknown","age_evidence":"依据(可省)","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
       '',
-      '已有角色表：' + JSON.stringify(rosterList),
-      '最近已确认的对白角色：' + JSON.stringify(compactHistory),
-      '当前相邻段落：' + String(text || '').slice(0, 700),
+      '已有角色：' + JSON.stringify(rosterList),
+      '最近说话人：' + JSON.stringify(compactHistory),
+      '当前段落：' + String(text || '').slice(0, 250),
       '待识别对白：' + JSON.stringify(dialogues.map(item => ({
         id: item.id,
-        before: item.before,
-        text: item.text,
-        after: item.after
+        before: String(item.before || '').slice(-45),
+        text: String(item.text || '').slice(0, 120),
+        after: String(item.after || '').slice(0, 45)
       })))
     ].join('\n');
 
@@ -1081,21 +1077,34 @@
 
     let lastRawContent = '';
     try {
-      const parsed = await withTimeout(
-        (async () => {
-          let content = await requestAiChat(settings, body);
-          lastRawContent = String(content || '');
-          const analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
-            normalizePlainAiAnalysis(content, dialogues.length);
-          return analysis;
-        })(),
-        AI_ANALYSIS_TIMEOUT,
-        'AI响应较慢'
-      );
-      if (!parsed || !parsed.lines.length) {
-        await flutterBridge.log('AI格式不标准，已沿用角色记忆');
-        await cache.set('ai_last_status', '已沿用角色记忆');
-        return fallbacks;
+      // AI 超时后自动重试（最多 AI_MAX_RETRIES 次），避免一次超时就回落本地记忆。
+      let parsed = null;
+      let aiErr = null;
+      for (let attempt = 0; attempt <= AI_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          await appLog('AI第' + (attempt + 1) + '次尝试');
+          await new Promise(resolve => setTimeout(resolve, 400 * attempt));
+        }
+        try {
+          parsed = await withTimeout(
+            (async () => {
+              let content = await requestAiChat(settings, body);
+              lastRawContent = String(content || '');
+              const analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
+                normalizePlainAiAnalysis(content, dialogues.length);
+              return analysis;
+            })(),
+            AI_ANALYSIS_TIMEOUT,
+            'AI响应较慢'
+          );
+          if (parsed && parsed.lines && parsed.lines.length) break;
+          aiErr = aiErr || new Error('AI未返回有效结果');
+        } catch (e) {
+          aiErr = e;
+        }
+      }
+      if (!parsed || !parsed.lines || !parsed.lines.length) {
+        throw aiErr || new Error('AI未返回有效结果');
       }
 
       const profiles = {};
