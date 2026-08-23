@@ -410,42 +410,38 @@
     const narrator = await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice;
     const uiMode = await cache.get('ai_ui_mode') || 'settings';
     const endpoint = settings.aiEndpoint || DEFAULTS.aiEndpoint;
+    const rosterNames = Object.keys(roster).filter(k => roster[k] && roster[k].speaker);
+    const vKeys = Object.keys(voiceMap).filter(k => k !== '__narrator__');
 
     const parts = [];
-    parts.push('===== 福尼亚朗读引擎诊断 =====');
-    parts.push('引擎版本: v2026-08-24  (缓存 v12/v9/v9)');
-    parts.push('AI启用: ' + (enabled === 'true' ? '是' : '否'));
-    parts.push('AI接口: ' + endpoint);
-    parts.push('AI模型: ' + (settings.aiModel || '未选择'));
-    parts.push('AI密钥: ' + (settings.aiKey ? '已填(尾号' + settings.aiKey.slice(-4) + ')' : '未填'));
-    parts.push('近2分钟: 成功' + (stats.ok || 0) + '次 / 超时' + (stats.timeout || 0) + '次');
-    if (status) parts.push('状态: ' + status);
-    if (lastError) parts.push('最近错误: ' + lastError);
-    if (rawPreview) parts.push('AI原始返回: ' + rawPreview);
-    parts.push('界面模式: ' + uiMode + '  旁白音色: ' + narrator);
-    parts.push('---- 角色表(共' + Object.keys(roster).length + ') ----');
-    const rosterNames = Object.keys(roster).filter(k => roster[k] && roster[k].speaker);
-    parts.push(rosterNames.length
-      ? rosterNames.map(k => roster[k].speaker + '=' + (roster[k].gender || '?') + '/' + (roster[k].age || '?')).join('；')
-      : '(空)');
-    parts.push('---- 音色表(共' + Object.keys(voiceMap).length + ') ----');
-    const vKeys = Object.keys(voiceMap).filter(k => k !== '__narrator__');
-    parts.push(vKeys.length
+    parts.push('【福尼亚朗读引擎诊断】v2026-08-24(缓存v12/9/9)');
+    parts.push('AI启用:' + (enabled === 'true' ? '是' : '否') + ' 模型:' + (settings.aiModel || '未选'));
+    parts.push('接口:' + endpoint);
+    parts.push('密钥:' + (settings.aiKey ? '已填(尾' + settings.aiKey.slice(-4) + ')' : '未填') +
+      ' 近2分钟:成功' + (stats.ok || 0) + '/超时' + (stats.timeout || 0));
+    if (status) parts.push('状态:' + status);
+    if (lastError) parts.push('最近错误:' + lastError);
+    if (rawPreview) parts.push('AI原始返回:' + String(rawPreview).slice(0, 200));
+    parts.push('角色表:' + (rosterNames.length
+      ? rosterNames.map(k => roster[k].speaker + '=' + (roster[k].gender || '?') + '/' + (roster[k].age || '?')).join('，')
+      : '(空)'));
+    parts.push('音色表:' + (vKeys.length
       ? vKeys.map(k => {
           const e = voiceMap[k];
           const v = typeof e === 'string' ? e : (e && e.voice);
-          return k + '→' + (v ? v.replace('zh-CN-', '').replace('Neural', '') : '无') + (e && e.override ? '(手动)' : '');
-        }).join('；')
-      : '(空)');
-    parts.push('---- 运行流水(最近' + (Array.isArray(eventLog) ? eventLog.length : 0) + '条) ----');
+          return k + '→' + (v ? v.replace('zh-CN-', '').replace('Neural', '') : '无') + (e && e.override ? '(手)' : '');
+        }).join('，')
+      : '(空)'));
+    parts.push('--- 运行流水(最近' + (Array.isArray(eventLog) ? eventLog.length : 0) + '条) ---');
     if (Array.isArray(eventLog) && eventLog.length) {
-      parts.push(eventLog.join('\n'));
+      parts.push(eventLog.slice(-25).join('\n'));
     } else {
       parts.push('(暂无运行记录，朗读一段后再导出)');
     }
     const log = parts.join('\n');
     await cache.set('ai_debug_log', log);
-    await flutterBridge.showToast('诊断日志已生成。点【复制诊断日志】把内容发给开发者排查。');
+    // 直接以通知形式展示完整日志，便于长按复制后发给开发者。
+    await flutterBridge.showToast(log);
     return log;
   }
 
@@ -473,8 +469,7 @@
 
   async function openDebugLog() {
     await exportDebugLog();
-    await cache.set('ai_ui_mode', 'debug');
-    await flutterBridge.showToast('正在生成诊断日志，请重新打开设置面板查看');
+    await flutterBridge.showToast('↑ 日志已弹出，长按复制后发给我即可。');
     return 'ok';
   }
 
