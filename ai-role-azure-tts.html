@@ -112,6 +112,10 @@
     async getLoginInfo() {
       return await this.get('LoginInfo');
     }
+
+    async putLoginInfo(info) {
+      return await this.set('LoginInfo', info);
+    }
   }
 </script>
 
@@ -166,14 +170,17 @@
 
   async function readSettings() {
     const info = parseObject(await cache.getLoginInfo(), {});
-    return {
+    const settings = {
       aiEndpoint: String(info['AI接口'] || DEFAULTS.aiEndpoint).trim(),
       aiKey: String(info['AI密钥'] || '').trim(),
       aiModel: String(info['AI模型'] || DEFAULTS.aiModel).trim(),
       proxyEndpoint: String(info['TTS中转'] || DEFAULTS.proxyEndpoint).trim(),
       narratorVoice: String(info['旁白音色'] || DEFAULTS.narratorVoice).trim(),
-      aiEnabled: (await cache.get('ai_role_enabled')) !== 'false'
+      aiEnabled: false
     };
+    settings.aiEnabled = (await cache.get('ai_role_enabled')) === 'true' &&
+      (await cache.get('ai_valid_fingerprint')) === aiFingerprint(settings);
+    return settings;
   }
 
   function normalizeEndpoint(endpoint) {
@@ -182,6 +189,151 @@
     if (/\/chat\/completions$/i.test(url)) return url;
     if (/\/v1$/i.test(url)) return url + '/chat/completions';
     return url + '/v1/chat/completions';
+  }
+
+  function normalizeModelsEndpoint(endpoint) {
+    let url = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!url) return 'https://api.openai.com/v1/models';
+    url = url.replace(/\/chat\/completions$/i, '');
+    if (/\/v1$/i.test(url)) return url + '/models';
+    return url + '/v1/models';
+  }
+
+  function aiFingerprint(settings) {
+    return hashText(settings.aiEndpoint + '|' + settings.aiModel + '|' + settings.aiKey.slice(-8));
+  }
+
+  function responsePayload(response) {
+    return parseObject(response && (response.data || response.body || response), {});
+  }
+
+  function responseError(response, payload) {
+    const message = payload && payload.error
+      ? (payload.error.message || payload.error.code || JSON.stringify(payload.error))
+      : '';
+    return message || ('HTTP ' + (response ? response.statusCode : '无响应'));
+  }
+
+  async function requestAiChat(settings, body) {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + settings.aiKey
+    };
+    let response = await http.Post(
+      normalizeEndpoint(settings.aiEndpoint),
+      headers,
+      JSON.stringify(body),
+      'application/json',
+      true
+    );
+    let payload = responsePayload(response);
+
+    if ((!response || Number(response.statusCode || 200) >= 400) && body.response_format) {
+      const compatibleBody = {...body};
+      delete compatibleBody.response_format;
+      response = await http.Post(
+        normalizeEndpoint(settings.aiEndpoint),
+        headers,
+        JSON.stringify(compatibleBody),
+        'application/json',
+        true
+      );
+      payload = responsePayload(response);
+    }
+
+    if (!response || Number(response.statusCode || 200) >= 400) {
+      throw new Error(responseError(response, payload));
+    }
+    const content = payload.choices && payload.choices[0] && payload.choices[0].message
+      ? payload.choices[0].message.content
+      : payload.output_text;
+    if (!content) throw new Error(responseError(response, payload));
+    return content;
+  }
+
+  async function fetchAiModels() {
+    const settings = await readSettings();
+    if (!settings.aiEndpoint || !settings.aiKey) {
+      await flutterBridge.showToast('请先填写 AI接口 和 AI密钥');
+      return;
+    }
+
+    await cache.set('ai_role_enabled', 'false');
+    try {
+      const response = await http.Get(
+        normalizeModelsEndpoint(settings.aiEndpoint),
+        {'Authorization': 'Bearer ' + settings.aiKey, 'Content-Type': 'application/json'},
+        true
+      );
+      const payload = responsePayload(response);
+      if (!response || Number(response.statusCode || 200) >= 400) {
+        throw new Error(responseError(response, payload));
+      }
+      const models = (Array.isArray(payload.data) ? payload.data : [])
+        .map(item => typeof item === 'string' ? item : item.id)
+        .filter(Boolean)
+        .sort()
+        .slice(0, 60);
+      if (!models.length) throw new Error('接口没有返回模型列表');
+
+      await cache.set('ai_model_list', JSON.stringify(models));
+      const info = parseObject(await cache.getLoginInfo(), {});
+      if (!models.includes(String(info['AI模型'] || ''))) info['AI模型'] = models[0];
+      await cache.putLoginInfo(JSON.stringify(info));
+      await flutterBridge.showToast('获取到 ' + models.length + ' 个模型，重新打开设置即可选择');
+    } catch (error) {
+      await cache.set('ai_last_status', '获取模型失败：' + error.message);
+      await flutterBridge.showToast('获取模型失败：' + error.message);
+    }
+  }
+
+  async function setAiModel(model) {
+    const info = parseObject(await cache.getLoginInfo(), {});
+    info['AI模型'] = model;
+    await cache.putLoginInfo(JSON.stringify(info));
+    await cache.set('ai_role_enabled', 'false');
+    await cache.set('ai_last_status', '模型已选择，尚未测试');
+    await flutterBridge.showToast('已选择模型：' + model);
+  }
+
+  async function showAiStatus() {
+    const settings = await readSettings();
+    const enabled = await cache.get('ai_role_enabled');
+    const status = await cache.get('ai_last_status');
+    await flutterBridge.showToast(
+      (enabled === 'true' ? 'AI已启用' : 'AI未启用') + '｜模型：' +
+      (settings.aiModel || '未选择') + (status ? '｜' + status : '')
+    );
+  }
+
+  async function testAndEnableAI() {
+    const settings = await readSettings();
+    if (!settings.aiEndpoint || !settings.aiKey || !settings.aiModel) {
+      await flutterBridge.showToast('请先填写接口、密钥并选择模型');
+      return;
+    }
+    await cache.set('ai_role_enabled', 'false');
+    try {
+      const content = await requestAiChat(settings, {
+        model: settings.aiModel,
+        temperature: 0,
+        response_format: {type: 'json_object'},
+        messages: [
+          {role: 'system', content: '只输出严格 JSON。'},
+          {role: 'user', content: '返回 {"ok":true,"speaker":"小满","gender":"female","age":"child"}'}
+        ]
+      });
+      const parsed = parseObject(stripJsonFence(content), null);
+      if (!parsed) throw new Error('模型未返回 JSON');
+      await cache.set('ai_valid_fingerprint', aiFingerprint(settings));
+      await cache.set('ai_role_enabled', 'true');
+      await cache.remove('ai_disabled_notice');
+      await cache.set('ai_last_status', '连接测试成功');
+      await flutterBridge.showToast('AI连接成功，角色识别已启用');
+    } catch (error) {
+      await cache.set('ai_last_status', '测试失败：' + error.message);
+      await flutterBridge.showToast('AI测试失败：' + error.message);
+    }
   }
 
   function hashText(text) {
@@ -363,21 +515,7 @@
     };
 
     try {
-      const response = await http.Post(
-        normalizeEndpoint(settings.aiEndpoint),
-        {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + settings.aiKey},
-        JSON.stringify(body),
-        'application/json',
-        true
-      );
-      if (!response || Number(response.statusCode || 200) >= 400) {
-        throw new Error('AI HTTP ' + (response ? response.statusCode : '无响应'));
-      }
-
-      const payload = parseObject(response.data || response, {});
-      const content = payload.choices && payload.choices[0] && payload.choices[0].message
-        ? payload.choices[0].message.content
-        : payload.output_text;
+      const content = await requestAiChat(settings, body);
       const parsed = parseObject(stripJsonFence(content), null);
       if (!parsed || !Array.isArray(parsed.lines)) throw new Error('AI 返回缺少 lines');
 
@@ -546,6 +684,13 @@
     const text = String(speakText || '').trim();
     const settings = await readSettings();
     const segments = splitSpeechSegments(text);
+    if (!settings.aiEnabled && segments.some(item => item.type === 'dialogue')) {
+      const noticed = await cache.get('ai_disabled_notice');
+      if (!noticed) {
+        await cache.set('ai_disabled_notice', 'true');
+        await flutterBridge.showToast('AI尚未测试启用，当前使用本地角色判断');
+      }
+    }
     const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
     const rendered = [];
     let dialogueId = 0;
@@ -578,7 +723,11 @@
 
   async function setAiEnabled(enabled) {
     await cache.set('ai_role_enabled', enabled ? 'true' : 'false');
-    await flutterBridge.showToast(enabled ? '已启用 AI 角色识别' : '已停用 AI，改用本地判断');
+    if (!enabled) {
+      await cache.remove('ai_valid_fingerprint');
+      await cache.remove('ai_disabled_notice');
+    }
+    await flutterBridge.showToast(enabled ? '请使用“测试并启用AI”' : '已停用 AI，改用本地判断');
   }
 
   async function clearRoleCache() {
@@ -590,18 +739,39 @@
 
   // 返回非 http 内容时，阅读 App 会把下面的 JSON 显示成设置弹窗。
   async function getloginurl() {
+    const models = parseObject(await cache.get('ai_model_list'), []);
+    const info = parseObject(await cache.getLoginInfo(), {});
+    const currentModel = String(info['AI模型'] || DEFAULTS.aiModel);
     const ui = [
       {name: 'AI接口', type: 'text'},
       {name: 'AI密钥', type: 'password'},
       {name: 'AI模型', type: 'text'},
-      {name: '启用AI', type: 'button', action: 'setAiEnabled(true)', style: {layout_flexBasisPercent: 0.33}},
+      {name: '获取模型', type: 'button', action: 'fetchAiModels()', style: {layout_flexBasisPercent: 0.5}},
+      {name: '测试并启用AI', type: 'button', action: 'testAndEnableAI()', style: {layout_flexBasisPercent: 0.5}},
+      {name: '状态/当前模型', type: 'button', action: 'showAiStatus()', style: {layout_flexBasisPercent: 0.34}},
       {name: '停用AI', type: 'button', action: 'setAiEnabled(false)', style: {layout_flexBasisPercent: 0.33}},
       {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}}
     ];
+    for (const model of models.slice(0, 30)) {
+      ui.push({
+        name: (model === currentModel ? '✓ ' : '') + model,
+        type: 'button',
+        action: 'setAiModel(' + JSON.stringify(model) + ')',
+        style: {layout_flexBasisPercent: 0.5}
+      });
+    }
     return JSON.stringify(ui);
   }
 
-  async function login() {}
+  async function login() {
+    const settings = await readSettings();
+    const valid = await cache.get('ai_valid_fingerprint');
+    if (valid && valid !== aiFingerprint(settings)) {
+      await cache.set('ai_role_enabled', 'false');
+      await cache.remove('ai_disabled_notice');
+      await cache.set('ai_last_status', '接口、密钥或模型已修改，请重新测试');
+    }
+  }
 
   // 显式挂到 window，兼容使用反射查找入口函数的阅读 App WebView。
   window.getttsurl = getttsurl;
@@ -609,5 +779,9 @@
   window.login = login;
   window.setAiEnabled = setAiEnabled;
   window.clearRoleCache = clearRoleCache;
+  window.fetchAiModels = fetchAiModels;
+  window.setAiModel = setAiModel;
+  window.showAiStatus = showAiStatus;
+  window.testAndEnableAI = testAndEnableAI;
 </script>
 </html>
