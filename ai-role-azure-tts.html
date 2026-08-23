@@ -130,7 +130,7 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
-  const AI_ANALYSIS_TIMEOUT = 14000;
+  const AI_ANALYSIS_TIMEOUT = 9000;
   const ANALYSIS_BATCH_DELAY = 15;
   const MAX_ANALYSIS_BATCH_ITEMS = 3;
   const MAX_CONCURRENT_ANALYSIS_BATCHES = 3;
@@ -640,12 +640,35 @@
     return merged.length ? merged : [{type: 'narrator', text: String(text || '').trim()}];
   }
 
+  // 依据中文姓名特征推测性别（AI 不可用时也能正确区分角色音色）。
+  const FEMALE_NAME_SUFFIX = new Set('芳娜丽敏静雪梅兰婷蓉薇燕凤香玉红蕊荷琴露玲莉璐婉淑贞娉娥娟媛岚珊珍茹茜莹莺萱萍菱婧琼珠瑶瑟莲蕾蝶雅俪洁慧澜玥芷滟瑛芸韵茵涵琪倩妍姝菲盼眸含香曼梦晶月珂萌真'.split(''));
+  const MALE_NAME_SUFFIX = new Set('伟强磊明军勇杰涛斌刚健鹏辉平东峰超俊志龙顺海富贵有福栋义华建凯国川廷伯任武士翔文鸿庭盛浩政田民迪扬振宏泽博航洪铭杨昊辰轩宇哲毅修柱'.split(''));
+
+  function guessNameGender(name) {
+    const value = String(name || '').trim();
+    const han = value.match(/[\u4e00-\u9fa5]{2,4}/);
+    if (!han) return 'unknown';
+    const chars = han[0];
+    // 叠字名（如“真真”“婷婷”）多为女性。
+    if (chars.length === 2 && chars[0] === chars[1]) {
+      return /真|婷|玥|琪|洁|娟|芳|秀|美|英|丽|慧|玲|玉|雪|梅|兰/.test(chars) ? 'female' : 'unknown';
+    }
+    const last = chars[chars.length - 1];
+    if (FEMALE_NAME_SUFFIX.has(last)) return 'female';
+    if (MALE_NAME_SUFFIX.has(last)) return 'male';
+    return 'unknown';
+  }
+
   function inferSpeaker(context) {
     const value = String(context || '');
-    const pattern = /(?:^|[，。！？；、\s])([\u4e00-\u9fa5]{1,4}?)(?:急忙|轻声|低声|大声|冷冷地|笑着|哭着|突然|认真|温和地|沉声|缓缓|平静地)?(?:说道|说|问道|问|喊道|喊|答道|答|叫道|叫)/g;
-    let match;
-    let speaker = '';
-    while ((match = pattern.exec(value))) speaker = match[1];
+    // 姓名紧跟说话动词的最常见形式，支持“道/声道/说道/笑道/红着眼道”等变体。
+    const speechAdverb = /^(轻声|低声|大声|高声|冷冷地|笑着|哭着|突然|认真|温和地|沉声|缓缓|平静地|带着笑意|气愤地|激动地|淡淡地|不耐烦|慌张地|低声地|红着眼|红了眼|顿了顿|沉思片刻|沉默片刻|良久)$/;
+    const pattern = /(?:^|[，。！？；、\s])([\u4e00-\u9fa5]{1,4}?)(?:急忙|轻声|低声|大声|冷冷地|笑着|哭着|突然|认真|温和地|沉声|缓缓|平静地|带着笑意|红着眼|红了眼|顿了顿|沉思片刻)?(?:说道|道|说|问道|问|喊道|喊|答道|答|叫道|叫)/g;
+    let match, speaker = '';
+    while ((match = pattern.exec(value))) {
+      const cand = match[1];
+      if (!speechAdverb.test(cand)) speaker = cand;
+    }
     if (/解释|回应|补充|电话|一头|接着|继续/.test(speaker)) return '未命名角色';
     if (/^(她|女孩|姑娘|女子)$/.test(speaker)) return '女性角色';
     if (/^(他|男孩|男人|男子)$/.test(speaker)) return '男性角色';
@@ -679,6 +702,12 @@
     const nearbySpeaker = afterSpeaker !== '未命名角色'
       ? afterSpeaker
       : inferSpeaker(beforeClause);
+
+    // 代词/称谓线索判断不出性别时，用中文姓名特征推测（如“白真真”→女性）。
+    if (gender === 'unknown' && nearbySpeaker && !/未命名|角色/.test(nearbySpeaker)) {
+      const nameGender = guessNameGender(nearbySpeaker);
+      if (nameGender !== 'unknown') gender = nameGender;
+    }
 
     return {
       type: 'dialogue',
@@ -1025,9 +1054,10 @@
     const savedAge = existing && typeof existing === 'object' ? (existing.age || 'unknown') : 'unknown';
     voiceMap[identity] = {voice: voice, gender: savedGender, age: savedAge, override: true};
     await cache.set(key, JSON.stringify(voiceMap));
+    await cache.set('ai_ui_mode', 'voices');
     await removeCastCaches();
-    await flutterBridge.showToast('已为「' + identity + '」切换到 ' + voiceLabel(voice) + '，重新朗读生效');
-    return buildVoiceManagerUI();
+    await flutterBridge.showToast('已为「' + identity + '」切换到 ' + voiceLabel(voice) + '，重新打开设置查看/重读生效');
+    return 'ok';
   }
 
   // 移除某个角色的手动指定，恢复自动分配。
@@ -1039,10 +1069,11 @@
       delete entry.override;
       voiceMap[identity] = {voice: entry.voice, gender: entry.gender, age: entry.age};
       await cache.set(key, JSON.stringify(voiceMap));
+      await cache.set('ai_ui_mode', 'voices');
       await removeCastCaches();
       await flutterBridge.showToast('已恢复「' + identity + '」的自动音色');
     }
-    return buildVoiceManagerUI();
+    return 'ok';
   }
 
   // 清空配音相关上下文缓存（保留角色表与音色表，只重置上下文记忆）。
@@ -1055,9 +1086,10 @@
 
   async function switchNarratorVoice(voice) {
     await cache.set('ai_narrator_voice_override', voice);
+    await cache.set('ai_ui_mode', 'voices');
     await removeCastCaches();
-    await flutterBridge.showToast('旁白音色已切换为 ' + voiceLabel(voice));
-    return buildVoiceManagerUI();
+    await flutterBridge.showToast('旁白音色已切换为 ' + voiceLabel(voice) + '，重新打开设置查看/重读生效');
+    return 'ok';
   }
 
   // 生成音色管理面板的 JSON UI（从 voice map 列出各角色当前音色并提供切换）。
@@ -1110,7 +1142,7 @@
       }
       ui.push({name: '—', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}});
     }
-    ui.push({name: '关闭', type: 'button', action: 'getloginurl()', style: {layout_flexBasisPercent: 0.5}});
+    ui.push({name: '返回设置', type: 'button', action: 'closeVoiceManager()', style: {layout_flexBasisPercent: 0.5}});
     return JSON.stringify(ui);
   }
 
@@ -1324,7 +1356,11 @@
               before: before && before.type === 'narrator' ? before.text : '',
               after: after && after.type === 'narrator' ? after.text : ''
             };
-            if (lastFinalizedDialogueProfile && !hasSpeakerCue(boundaryContext)) {
+            // 只有当本条没有明确说话人名（泛称）时才沿用上一条；已点出具体
+            // 姓名（如“白真真”）且与上一条不同时，尊重该姓名及其性别音色。
+            const currentHasConcreteName = profile.speaker && !isGenericSpeaker(profile.speaker);
+            if (lastFinalizedDialogueProfile && !hasSpeakerCue(boundaryContext) &&
+              !currentHasConcreteName) {
               profile = {
                 ...profile,
                 speaker: lastFinalizedDialogueProfile.speaker,
@@ -1404,7 +1440,25 @@
   }
 
   // 返回非 http 内容时，阅读 App 会把下面的 JSON 显示成设置弹窗。
+  // 音色管理入口：设置标志后提示重开设置面板即切换到音色管理视图。
+  async function openVoiceManager() {
+    await cache.set('ai_ui_mode', 'voices');
+    await flutterBridge.showToast('已进入配音音色管理，请重新打开设置面板');
+    return 'ok';
+  }
+
+  // 返回设置视图。
+  async function closeVoiceManager() {
+    await cache.remove('ai_ui_mode');
+    await flutterBridge.showToast('已返回设置面板');
+    return 'ok';
+  }
+
   async function getloginurl() {
+    // 音色管理模式：getloginurl 渲染音色管理面板而非设置面板。
+    if ((await cache.get('ai_ui_mode')) === 'voices') {
+      return buildVoiceManagerUI();
+    }
     const models = parseObject(await cache.get('ai_model_list'), []);
     const info = parseObject(await cache.getLoginInfo(), {});
     const currentModel = String((await cache.get('ai_selected_model')) || info['AI模型'] || DEFAULTS.aiModel);
@@ -1416,7 +1470,7 @@
       {name: '测试并启用AI', type: 'button', action: 'testAndEnableAI()', style: {layout_flexBasisPercent: 0.5}},
       {name: '状态/当前模型', type: 'button', action: 'showAiStatus()', style: {layout_flexBasisPercent: 0.34}},
       {name: '停用AI', type: 'button', action: 'setAiEnabled(false)', style: {layout_flexBasisPercent: 0.33}},
-      {name: '音色管理', type: 'button', action: 'buildVoiceManagerUI()', style: {layout_flexBasisPercent: 0.34}},
+      {name: '音色管理', type: 'button', action: 'openVoiceManager()', style: {layout_flexBasisPercent: 0.34}},
       {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}}
     ];
     for (const model of models.slice(0, 30)) {
@@ -1443,6 +1497,8 @@
   window.showAiStatus = showAiStatus;
   window.testAndEnableAI = testAndEnableAI;
   window.buildVoiceManagerUI = buildVoiceManagerUI;
+  window.openVoiceManager = openVoiceManager;
+  window.closeVoiceManager = closeVoiceManager;
   window.switchVoice = switchVoice;
   window.resetVoice = resetVoice;
   window.switchNarratorVoice = switchNarratorVoice;
