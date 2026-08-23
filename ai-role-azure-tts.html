@@ -1000,7 +1000,7 @@
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
     const chapterMemory = await readChapterMemory(text);
-    const dialogueHistory = chapterMemory.dialogues.slice(-3);
+    const dialogueHistory = chapterMemory.dialogues.slice(-8);
     let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
     if (previousProfile) {
       for (const item of dialogues) {
@@ -1035,7 +1035,7 @@
       gender: item.gender,
       age: item.age
     }));
-    const compactHistory = dialogueHistory.slice(-3).map(item => ({
+    const compactHistory = dialogueHistory.slice(-6).map(item => ({
       speaker: item.speaker,
       gender: item.gender,
       age: item.age,
@@ -1046,6 +1046,7 @@
       '请判断每条对白是谁说的，并推断性别、年龄层和当前情绪。相同角色必须使用相同 speaker 名称。',
       '性别判断规则：优先使用上下文线索（他/她、称谓等）；上下文没有明确线索时，可根据姓名本身判断大概率性别（例如“白真真”“李婉婷”大概率是女性，“王铁柱”“张建国”大概率是男性），此时在 gender_evidence 中写“姓名推测”；姓名无明显性别倾向或纯属代称时才返回 unknown。',
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
+      '能确定是谁在说话就给出具体角色名（优先用“已有角色表”里的名字）；只有完全无法从上下文判断时才用“未命名角色”。若对话与上一句或已知角色明显衔接，应沿用该角色而非新建“未命名角色”。',
       '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
       '原文不一定会写“某某说”。即使没有说/道等动词，也要结合上下文（谁在场、上一句是谁、动作与剧情）推断本句是谁说的，并在对应 speaker 上给出该角色的性别。只要说话人是确定角色（如张羽），gender 就必须与该角色一致，严禁沿袭上一句不同角色的性别。',
