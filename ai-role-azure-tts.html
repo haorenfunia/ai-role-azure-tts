@@ -1024,9 +1024,9 @@
       await appLog('命中AI缓存(' + cacheKey.slice(0, 12) + ')，直接使用已识别结果');
       return cached;
     }
-    await appLog('未命中缓存，发起AI分析(共' + dialogues.length + '句对白)');
-
     const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
+    const knownCount = Object.keys(roster).filter(k => roster[k] && roster[k].speaker).length;
+    await appLog('未命中缓存，发起AI分析(共' + dialogues.length + '句，携带已知角色' + knownCount + '个)');
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
