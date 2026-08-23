@@ -130,7 +130,7 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
-  const AI_ANALYSIS_TIMEOUT = 9000;
+  const AI_ANALYSIS_TIMEOUT = 16000;
   const ANALYSIS_BATCH_DELAY = 15;
   const MAX_ANALYSIS_BATCH_ITEMS = 3;
   const MAX_CONCURRENT_ANALYSIS_BATCHES = 3;
@@ -369,10 +369,16 @@
     const settings = await readSettings();
     const enabled = await cache.get('ai_role_enabled');
     const status = await cache.get('ai_last_status');
-    await flutterBridge.showToast(
-      (enabled === 'true' ? 'AI已启用' : 'AI未启用') + '｜模型：' +
-      (settings.aiModel || '未选择') + (status ? '｜' + status : '')
-    );
+    const stats = parseObject(await cache.get('ai_run_stats'), {ok: 0, timeout: 0});
+    const endpoint = settings.aiEndpoint || DEFAULTS.aiEndpoint;
+    const lines = [
+      (enabled === 'true' ? '✅ AI 已启用' : '❌ AI 未启用') + '｜模型：' + (settings.aiModel || '未选择'),
+      '接口：' + endpoint,
+      '密钥：' + (settings.aiKey ? '已填写(' + settings.aiKey.slice(-4) + ')' : '未填写'),
+      '近2分钟：AI成功 ' + (stats.ok || 0) + ' 次，超时 ' + (stats.timeout || 0) + ' 次',
+      status ? '状态：' + status : ''
+    ];
+    await flutterBridge.showToast(lines.join('\n'));
   }
 
   async function testAndEnableAI() {
@@ -1021,9 +1027,11 @@
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
+      await bumpAiStat('ok');
       return profiles;
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
+      await bumpAiStat('timeout');
       if (lastRawContent) await cache.set('ai_last_raw_preview', lastRawContent.slice(0, 500));
       await cache.set('ai_last_status', 'AI较慢，已沿用角色记忆');
       const lastError = await cache.get('ai_last_read_error');
@@ -1033,6 +1041,15 @@
       }
       return fallbacks;
     }
+  }
+
+  // 累计 AI 成功/超时次数（2 分钟内滚动），用于诊断接口是否稳定。
+  async function bumpAiStat(kind) {
+    const stats = parseObject(await cache.get('ai_run_stats'), {ok: 0, timeout: 0, ts: 0});
+    if (Date.now() - (stats.ts || 0) > 120000) { stats.ok = 0; stats.timeout = 0; }
+    stats[kind] = (stats[kind] || 0) + 1;
+    stats.ts = Date.now();
+    await cache.set('ai_run_stats', JSON.stringify(stats));
   }
 
   function voicePool(profile) {
