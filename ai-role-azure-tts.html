@@ -246,10 +246,13 @@
     if (!response || Number(response.statusCode || 200) >= 400) {
       throw new Error(responseError(response, payload));
     }
-    const message = payload.choices && payload.choices[0] && payload.choices[0].message;
+    const choice = payload.choices && payload.choices[0];
+    const message = choice && choice.message;
+    const toolArguments = message && message.tool_calls && message.tool_calls[0] &&
+      message.tool_calls[0].function && message.tool_calls[0].function.arguments;
     let content = message
-      ? (message.content || message.text || message.output_text)
-      : (payload.output_text || payload.content || payload.text || payload.response);
+      ? (message.content || message.text || message.output_text || toolArguments || message.reasoning_content)
+      : (choice && choice.text || payload.output_text || payload.content || payload.text || payload.response);
     if (Array.isArray(content)) {
       content = content.map(item => typeof item === 'string'
         ? item
@@ -471,11 +474,26 @@
     } else if (value && typeof value === 'object') {
       narration = value.narration || value.narrator || value.prosody || {};
       lines = value.lines || value.dialogues || value.dialogue || value.results ||
-        value.items || value.characters || value.roles;
-      if (!lines && (value.speaker || value.role || value.gender || value.age)) lines = [value];
+        value.items || value.characters || value.roles || value['对白'] || value['对话'] ||
+        value['角色分析'] || value['识别结果'] || value['结果'];
+      if (!lines && (value.speaker || value.role || value.gender || value.age ||
+        value['角色'] || value['说话人'] || value['性别'] || value['年龄'])) lines = [value];
       if (!lines) {
         const numericKeys = Object.keys(value).filter(key => /^\d+$/.test(key));
         if (numericKeys.length) lines = numericKeys.sort((a, b) => Number(a) - Number(b)).map(key => value[key]);
+      }
+      if (!lines) {
+        const entries = Object.entries(value).filter(([, item]) => item && typeof item === 'object' && !Array.isArray(item));
+        const roleEntries = entries.filter(([, item]) => item.gender || item.age || item['性别'] || item['年龄']);
+        if (roleEntries.length) lines = roleEntries.map(([speaker, item]) => ({speaker: speaker, ...item}));
+      }
+      if (!lines) {
+        const queue = Object.values(value).filter(item => item && typeof item === 'object');
+        while (queue.length && !lines) {
+          const item = queue.shift();
+          if (Array.isArray(item) && item.some(entry => entry && typeof entry === 'object')) lines = item;
+          else if (item && typeof item === 'object') queue.push(...Object.values(item).filter(entry => entry && typeof entry === 'object'));
+        }
       }
     }
 
@@ -521,9 +539,34 @@
 
   function normalizeProsody(result) {
     return {
-      emotion: normalizeEmotion(result && result.emotion),
-      intensity: normalizeIntensity(result && result.intensity)
+      emotion: normalizeEmotion(result && (result.emotion || result['情绪'] || result['语气'])),
+      intensity: normalizeIntensity(result && (result.intensity || result['强度'] || result['情绪强度']))
     };
+  }
+
+  function normalizePlainAiAnalysis(content, dialogueCount) {
+    const raw = String(content || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    if (!raw) return null;
+    const chunks = raw.split(/\n+/).map(item => item.trim()).filter(Boolean);
+    const lines = [];
+    for (const chunk of chunks) {
+      const speakerMatch = chunk.match(/(?:speaker|role|说话人|说话角色|角色|人物|姓名)\s*[:：=]\s*["“]?([^,，;；|\n}"”]+)/i);
+      const genderMatch = chunk.match(/(?:gender|sex|性别)\s*[:：=]\s*["“]?([^,，;；|\n}"”]+)/i);
+      const ageMatch = chunk.match(/(?:age|age_group|年龄段?|年龄层)\s*[:：=]\s*["“]?([^,，;；|\n}"”]+)/i);
+      const emotionMatch = chunk.match(/(?:emotion|情绪|语气)\s*[:：=]\s*["“]?([^,，;；|\n}"”]+)/i);
+      if (!speakerMatch && !genderMatch && !ageMatch) continue;
+      lines.push({
+        id: lines.length + 1,
+        speaker: speakerMatch ? speakerMatch[1].trim() : '',
+        gender: genderMatch ? genderMatch[1].trim() : 'unknown',
+        age: ageMatch ? ageMatch[1].trim() : 'unknown',
+        emotion: emotionMatch ? emotionMatch[1].trim() : 'neutral',
+        intensity: 0.3,
+        age_evidence: ageMatch ? ageMatch[1].trim() : '无'
+      });
+      if (lines.length >= dialogueCount) break;
+    }
+    return lines.length ? {narration: {}, lines: lines} : null;
   }
 
   function splitSpeechSegments(text) {
@@ -603,13 +646,14 @@
   }
 
   function normalizeDialogueProfile(result, fallback) {
-    const speaker = String(result.speaker || result.role || '').trim();
+    const speaker = String(result.speaker || result.role || result.name ||
+      result['角色'] || result['说话人'] || result['人物'] || result['姓名'] || '').trim();
     const prosody = normalizeProsody(result);
     return {
       type: 'dialogue',
       speaker: speaker || fallback.speaker,
-      gender: normalizeGender(result.gender || fallback.gender),
-      age: normalizeAge(result.age || result.age_group || fallback.age),
+      gender: normalizeGender(result.gender || result.sex || result['性别'] || fallback.gender),
+      age: normalizeAge(result.age || result.age_group || result['年龄'] || result['年龄段'] || fallback.age),
       emotion: prosody.emotion,
       intensity: prosody.intensity,
       confidence: Number(result.confidence || fallback.confidence || 0)
@@ -629,7 +673,8 @@
       if (profile.gender === 'unknown' && known.gender) profile.gender = known.gender;
       if (profile.age === 'unknown' && known.age) profile.age = known.age;
     }
-    if (profile.age === 'child' && !(known && known.age === 'child') && !hasStrictChildEvidence(line.age_evidence)) {
+    if (profile.age === 'child' && !(known && known.age === 'child') &&
+      !hasStrictChildEvidence(line.age_evidence || line['年龄依据'])) {
       profile.age = known && known.age ? known.age : 'unknown';
     }
     return profile;
@@ -659,7 +704,7 @@
 
   function keepPreviousSpeaker(profile, line, item, previousProfile, roster) {
     if (!previousProfile || hasSpeakerCue(item)) return profile;
-    const sameAsPrevious = line.same_as_previous;
+    const sameAsPrevious = line.same_as_previous ?? line['承接上一句'] ?? line['与上一句同一人'];
     const namedInsideDialogue = profile.speaker && String(item.text || '').includes(profile.speaker) &&
       !/(?:我是|我叫|名字叫)/.test(String(item.text || ''));
     const unknownNewSpeaker = profile.speaker && profile.speaker !== previousProfile.speaker && !roster[profile.speaker];
@@ -778,11 +823,14 @@
       ]
     };
 
+    let lastRawContent = '';
     try {
       const parsed = await withTimeout(
         (async () => {
           let content = await requestAiChat(settings, body);
-          let analysis = normalizeAiAnalysis(parseAiPayload(content));
+          lastRawContent = String(content || '');
+          let analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
+            normalizePlainAiAnalysis(content, dialogues.length);
           if (analysis && analysis.lines.length) return analysis;
 
           await flutterBridge.log('AI首次返回格式异常，自动进行极简重试：' + String(content || '').slice(0, 300));
@@ -803,7 +851,9 @@
             ]
           };
           content = await requestAiChat(settings, retryBody);
-          analysis = normalizeAiAnalysis(parseAiPayload(content));
+          lastRawContent = String(content || '');
+          analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
+            normalizePlainAiAnalysis(content, dialogues.length);
           return analysis;
         })(),
         AI_ANALYSIS_TIMEOUT,
@@ -839,7 +889,9 @@
       return profiles;
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
+      if (lastRawContent) await cache.set('ai_last_raw_preview', lastRawContent.slice(0, 500));
       await cache.set('ai_last_status', '朗读识别失败：' + error.message);
+      if (error.message === 'AI返回格式无法识别') return fallbacks;
       const lastError = await cache.get('ai_last_read_error');
       if (lastError !== error.message) {
         await cache.set('ai_last_read_error', error.message);
