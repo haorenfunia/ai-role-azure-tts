@@ -1605,8 +1605,10 @@
     }
     const rendered = await scheduleRolePreparation(text, segments, settings);
 
+    // 标注本次调用对应的文本开头，便于区分并发预取的多个章节。
+    const textHead = String(text).replace(/\s+/g, '').slice(0, 14);
     await appLog('朗读调用：AI=' + (settings.aiEnabled ? '开' : '关') + '，对白' +
-      segments.filter(s => s.type === 'dialogue').length + '句');
+      segments.filter(s => s.type === 'dialogue').length + '句，文本「' + textHead + '…」');
 
     await flutterBridge.log(
       '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
