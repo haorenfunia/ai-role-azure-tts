@@ -130,9 +130,9 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
-  const AI_ANALYSIS_MIN_TIMEOUT = 35000;
-  const AI_ANALYSIS_MAX_TIMEOUT = 60000;
+  const AI_ANALYSIS_TIMEOUT = 14000;
   const ANALYSIS_BATCH_DELAY = 15;
+  const MAX_ANALYSIS_BATCH_ITEMS = 3;
 
   const VOICE_POOLS = {
     female: {
@@ -763,7 +763,7 @@
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
     const chapterMemory = await readChapterMemory(text);
-    const dialogueHistory = chapterMemory.dialogues.slice(-6);
+    const dialogueHistory = chapterMemory.dialogues.slice(-3);
     let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
     if (previousProfile) {
       for (const item of dialogues) {
@@ -790,20 +790,20 @@
 
     const roster = parseObject(await cache.get('ai_character_roster_v3'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
-    const rosterList = Object.values(roster).slice(-24).map(item => ({
+    const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
       gender: item.gender,
       age: item.age
     }));
-    const compactHistory = dialogueHistory.slice(-4).map(item => ({
+    const compactHistory = dialogueHistory.slice(-3).map(item => ({
       speaker: item.speaker,
       gender: item.gender,
       age: item.age,
       text: String(item.text || '').slice(0, 80)
     }));
     const prompt = [
-      '你是中文小说的配音导演。文本已经被程序严格拆成旁白和对白，旁白无需处理。',
-      '请判断每条对白是谁说的，并推断性别和年龄层。相同角色必须始终使用完全相同的 speaker 名称。',
+      '你是中文小说配音助手，只分析当前几个相邻小段，不做整章分析。旁白无需分配角色。',
+      '请判断每条对白是谁说的，并推断性别、年龄层和当前情绪。相同角色必须使用相同 speaker 名称。',
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
       '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
@@ -815,7 +815,7 @@
       '',
       '已有角色表：' + JSON.stringify(rosterList),
       '最近已确认的对白角色：' + JSON.stringify(compactHistory),
-      '当前段落：' + String(text || '').slice(0, 1200),
+      '当前相邻段落：' + String(text || '').slice(0, 700),
       '待识别对白：' + JSON.stringify(dialogues.map(item => ({
         id: item.id,
         before: item.before,
@@ -827,7 +827,7 @@
     const body = {
       model: settings.aiModel,
       temperature: 0,
-      max_tokens: Math.min(1800, Math.max(600, dialogues.length * 180)),
+      max_tokens: Math.min(900, Math.max(350, dialogues.length * 110)),
       response_format: {type: 'json_object'},
       messages: [
         {role: 'system', content: '你只输出严格 JSON，保持角色名称稳定。'},
@@ -836,47 +836,23 @@
     };
 
     let lastRawContent = '';
-    // 短段也给模型足够的联网响应时间；对白较多时再逐步增加，避免固定 15 秒误杀。
-    const analysisTimeout = Math.min(
-      AI_ANALYSIS_MAX_TIMEOUT,
-      AI_ANALYSIS_MIN_TIMEOUT + Math.max(0, dialogues.length - 2) * 2500
-    );
     try {
       const parsed = await withTimeout(
         (async () => {
           let content = await requestAiChat(settings, body);
           lastRawContent = String(content || '');
-          let analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
-            normalizePlainAiAnalysis(content, dialogues.length);
-          if (analysis && analysis.lines.length) return analysis;
-
-          await flutterBridge.log('AI首次返回格式异常，自动进行极简重试：' + String(content || '').slice(0, 300));
-          const retryBody = {
-            model: settings.aiModel,
-            temperature: 0,
-            max_tokens: Math.min(1800, Math.max(600, dialogues.length * 180)),
-            response_format: {type: 'json_object'},
-            messages: [
-              {role: 'system', content: '只输出一个JSON对象，禁止解释、Markdown和思考过程。'},
-              {role: 'user', content: [
-                '识别下列小说对白的speaker、gender、age、emotion。',
-                '严格返回：{"lines":[{"id":1,"speaker":"角色","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"依据或无","emotion":"neutral|calm|happy|sad|angry|nervous|excited|serious|tender","intensity":0.3,"same_as_previous":false}]}',
-                '上一说话人：' + (previousProfile ? JSON.stringify(previousProfile) : '无'),
-                '角色表：' + JSON.stringify(rosterList.slice(-20)),
-                '对白：' + JSON.stringify(dialogues.map(item => ({id: item.id, before: item.before, text: item.text, after: item.after})))
-              ].join('\n')}
-            ]
-          };
-          content = await requestAiChat(settings, retryBody);
-          lastRawContent = String(content || '');
-          analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
+          const analysis = normalizeAiAnalysis(parseAiPayload(content)) ||
             normalizePlainAiAnalysis(content, dialogues.length);
           return analysis;
         })(),
-        analysisTimeout,
-        'AI分析超过' + Math.round(analysisTimeout / 1000) + '秒'
+        AI_ANALYSIS_TIMEOUT,
+        'AI响应较慢'
       );
-      if (!parsed || !parsed.lines.length) throw new Error('AI返回格式无法识别');
+      if (!parsed || !parsed.lines.length) {
+        await flutterBridge.log('AI格式不标准，已沿用角色记忆');
+        await cache.set('ai_last_status', '已沿用角色记忆');
+        return fallbacks;
+      }
 
       const profiles = {};
       for (const item of dialogues) {
@@ -907,12 +883,11 @@
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
       if (lastRawContent) await cache.set('ai_last_raw_preview', lastRawContent.slice(0, 500));
-      await cache.set('ai_last_status', '朗读识别失败：' + error.message);
-      if (error.message === 'AI返回格式无法识别') return fallbacks;
+      await cache.set('ai_last_status', 'AI较慢，已沿用角色记忆');
       const lastError = await cache.get('ai_last_read_error');
       if (lastError !== error.message) {
         await cache.set('ai_last_read_error', error.message);
-        await flutterBridge.showToast('AI识别失败，已改用本地：' + error.message);
+        await flutterBridge.log('AI识别暂不可用：' + error.message);
       }
       return fallbacks;
     }
@@ -960,13 +935,13 @@
     const adjustments = {
       neutral: {rate: 0, pitch: 0},
       calm: {rate: -3, pitch: 0},
-      happy: {rate: 3, pitch: 1},
-      sad: {rate: -4, pitch: -1},
-      angry: {rate: 4, pitch: 1},
-      nervous: {rate: 3, pitch: 0},
-      excited: {rate: 5, pitch: 1},
-      serious: {rate: -2, pitch: -1},
-      tender: {rate: -3, pitch: 0}
+      happy: {rate: 5, pitch: 2},
+      sad: {rate: -6, pitch: -2},
+      angry: {rate: 7, pitch: 2},
+      nervous: {rate: 5, pitch: 1},
+      excited: {rate: 8, pitch: 2},
+      serious: {rate: -3, pitch: -1},
+      tender: {rate: -4, pitch: 1}
     };
     const value = adjustments[normalizeEmotion(profile && profile.emotion)] || adjustments.neutral;
     return {
@@ -1099,7 +1074,8 @@
     roleBatchTimer = null;
     if (roleBatchBusy || !pendingRoleBatch.length) return;
     roleBatchBusy = true;
-    const batch = pendingRoleBatch.splice(0, pendingRoleBatch.length);
+    // 只合并少量相邻预取段，避免把整章塞给 AI 后变慢或串错角色。
+    const batch = pendingRoleBatch.splice(0, MAX_ANALYSIS_BATCH_ITEMS);
 
     try {
       const combinedText = batch.map(item => item.text).join('\n');
