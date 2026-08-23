@@ -130,8 +130,8 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
-  const AI_ANALYSIS_TIMEOUT = 3500;
-  const ANALYSIS_BATCH_DELAY = 35;
+  const AI_ANALYSIS_TIMEOUT = 15000;
+  const ANALYSIS_BATCH_DELAY = 15;
 
   const VOICE_POOLS = {
     female: {
@@ -607,11 +607,25 @@
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
     const chapterMemory = await readChapterMemory(text);
-    const recent = chapterMemory.text.slice(-2800);
-    const dialogueHistory = chapterMemory.dialogues.slice(-10);
+    const dialogueHistory = chapterMemory.dialogues.slice(-6);
     let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
-    const cacheContext = previousProfile ? previousProfile.speaker + '|' + recent.slice(-500) : recent.slice(-500);
-    const cacheKey = 'ai_cast_v6_' + hashText(text + '|' + cacheContext);
+    if (previousProfile) {
+      for (const item of dialogues) {
+        if (!hasSpeakerCue(item)) {
+          fallbacks[item.id] = {
+            type: 'dialogue',
+            speaker: previousProfile.speaker,
+            gender: previousProfile.gender,
+            age: previousProfile.age,
+            emotion: 'neutral',
+            intensity: 0.3,
+            confidence: previousProfile.confidence || 0.5
+          };
+        }
+      }
+    }
+    const cacheContext = previousProfile ? previousProfile.speaker : '';
+    const cacheKey = 'ai_cast_v7_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
@@ -633,9 +647,8 @@
       '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
-      '本章已读剧情：' + (recent || '无'),
       '最近已确认的对白角色：' + JSON.stringify(dialogueHistory),
-      '当前段落：' + String(text || '').slice(0, 1800),
+      '当前段落：' + String(text || '').slice(0, 1200),
       '待识别对白：' + JSON.stringify(dialogues.map(item => ({
         id: item.id,
         before: item.before,
@@ -647,7 +660,7 @@
     const body = {
       model: settings.aiModel,
       temperature: 0,
-      max_tokens: 900,
+      max_tokens: 420,
       response_format: {type: 'json_object'},
       messages: [
         {role: 'system', content: '你只输出严格 JSON，保持角色名称稳定。'},
@@ -659,7 +672,7 @@
       const content = await withTimeout(
         requestAiChat(settings, body),
         AI_ANALYSIS_TIMEOUT,
-        'AI分析超过3.5秒'
+        'AI分析超过15秒'
       );
       const parsed = parseObject(stripJsonFence(content), null);
       if (!parsed || !Array.isArray(parsed.lines)) throw new Error('AI 返回缺少 lines');
