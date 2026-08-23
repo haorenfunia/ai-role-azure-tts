@@ -172,6 +172,38 @@
     }
   }
 
+  // 微软中文音色全集：标注友好名与性别，供音色管理面板展示。
+  const VOICE_META = {
+    'zh-CN-XiaoxiaoNeural': {name: '晓晓', gender: 'female'},
+    'zh-CN-XiaoyiNeural': {name: '晓伊', gender: 'female'},
+    'zh-CN-XiaohanNeural': {name: '晓涵', gender: 'female'},
+    'zh-CN-XiaomengNeural': {name: '晓梦', gender: 'female'},
+    'zh-CN-XiaoyanNeural': {name: '晓颜', gender: 'female'},
+    'zh-CN-XiaozhenNeural': {name: '晓甄', gender: 'female'},
+    'zh-CN-XiaobeiNeural': {name: '晓北', gender: 'female'},
+    'zh-CN-XiaoniNeural': {name: '晓妮', gender: 'female'},
+    'zh-CN-XiaoxuanNeural': {name: '晓萱', gender: 'female'},
+    'zh-CN-XiaomoNeural': {name: '晓墨', gender: 'female'},
+    'zh-CN-XiaoruiNeural': {name: '晓睿', gender: 'female'},
+    'zh-CN-XiaoqiuNeural': {name: '晓秋', gender: 'female'},
+    'zh-CN-XiaoshuangNeural': {name: '晓双', gender: 'female'},
+    'zh-CN-XiaoyouNeural': {name: '晓悠', gender: 'female'},
+    'zh-CN-YunxiNeural': {name: '云希', gender: 'male'},
+    'zh-CN-YunxiaNeural': {name: '云夏', gender: 'male'},
+    'zh-CN-YunjianNeural': {name: '云健', gender: 'male'},
+    'zh-CN-YunhaoNeural': {name: '云浩', gender: 'male'},
+    'zh-CN-YunjieNeural': {name: '云杰', gender: 'male'},
+    'zh-CN-YunzeNeural': {name: '云泽', gender: 'male'},
+    'zh-CN-YunfengNeural': {name: '云枫', gender: 'male'},
+    'zh-CN-YunyangNeural': {name: '云扬', gender: 'male'},
+    'zh-CN-YunyeNeural': {name: '云野', gender: 'male'},
+    'zh-CN-YunyiMultilingualNeural': {name: '云逸旁白', gender: 'male'}
+  };
+  function voiceLabel(voice) {
+    const meta = VOICE_META[voice];
+    return meta ? (meta.name + '·' + (meta.gender === 'male' ? '男' : '女')) : voice;
+  }
+
   async function readSettings() {
     const info = parseObject(await cache.getLoginInfo(), {});
     const selectedModel = String((await cache.get('ai_selected_model')) || '').trim();
@@ -953,14 +985,19 @@
   }
 
   async function resolveVoice(profile, settings) {
-    if (profile.type !== 'dialogue') return settings.narratorVoice;
+    if (profile.type !== 'dialogue') {
+      const narratorOverride = await cache.get('ai_narrator_voice_override');
+      return narratorOverride || settings.narratorVoice;
+    }
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v4'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v6'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
     const saved = voiceMap[identity];
     const savedVoice = typeof saved === 'string' ? saved : saved && saved.voice;
+    // 用户手动指定过的音色拥有最高优先级，不再被角色性别/年龄匹配校验覆盖。
+    if (saved && saved.override && savedVoice) return savedVoice;
     if (voiceMatchesProfile(savedVoice, profile)) return savedVoice;
 
     const pool = voicePool(profile);
@@ -975,8 +1012,106 @@
       }
     }
     voiceMap[identity] = {voice: voice, gender: profile.gender, age: profile.age};
-    await cache.set('ai_speaker_voice_map_v4', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v6', JSON.stringify(voiceMap));
     return voice;
+  }
+
+  // 手动给某个角色指定音色，写入 voice map 并标记为 override（最高优先级）。
+  async function switchVoice(identity, voice) {
+    const key = 'ai_speaker_voice_map_v6';
+    const voiceMap = parseObject(await cache.get(key), {});
+    const existing = voiceMap[identity];
+    const savedGender = existing && typeof existing === 'object' ? (existing.gender || 'unknown') : 'unknown';
+    const savedAge = existing && typeof existing === 'object' ? (existing.age || 'unknown') : 'unknown';
+    voiceMap[identity] = {voice: voice, gender: savedGender, age: savedAge, override: true};
+    await cache.set(key, JSON.stringify(voiceMap));
+    await removeCastCaches();
+    await flutterBridge.showToast('已为「' + identity + '」切换到 ' + voiceLabel(voice) + '，重新朗读生效');
+    return buildVoiceManagerUI();
+  }
+
+  // 移除某个角色的手动指定，恢复自动分配。
+  async function resetVoice(identity) {
+    const key = 'ai_speaker_voice_map_v6';
+    const voiceMap = parseObject(await cache.get(key), {});
+    const entry = voiceMap[identity];
+    if (entry && typeof entry === 'object') {
+      delete entry.override;
+      voiceMap[identity] = {voice: entry.voice, gender: entry.gender, age: entry.age};
+      await cache.set(key, JSON.stringify(voiceMap));
+      await removeCastCaches();
+      await flutterBridge.showToast('已恢复「' + identity + '」的自动音色');
+    }
+    return buildVoiceManagerUI();
+  }
+
+  // 清空配音相关上下文缓存（保留角色表与音色表，只重置上下文记忆）。
+  async function removeCastCaches() {
+    lastFinalizedDialogueProfile = null;
+    await cache.remove('ai_recent_context');
+    await cache.remove('ai_chapter_memory_v3');
+    await cache.remove('ai_chapter_memory_v4');
+  }
+
+  async function switchNarratorVoice(voice) {
+    await cache.set('ai_narrator_voice_override', voice);
+    await removeCastCaches();
+    await flutterBridge.showToast('旁白音色已切换为 ' + voiceLabel(voice));
+    return buildVoiceManagerUI();
+  }
+
+  // 生成音色管理面板的 JSON UI（从 voice map 列出各角色当前音色并提供切换）。
+  async function buildVoiceManagerUI() {
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v6'), {});
+    const ui = [
+      {name: '配音音色管理', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}},
+      {name: '旁白音色：' + voiceLabel(await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice), type: 'text'}
+    ];
+    const narratorVoices = ['zh-CN-YunyiMultilingualNeural', 'zh-CN-YunxiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunyeNeural', 'zh-CN-YunzeNeural'];
+    const currentNarrator = await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice;
+    for (const v of narratorVoices) {
+      ui.push({
+        name: (v === currentNarrator ? '✓ ' : '') + voiceLabel(v) + ' 旁白',
+        type: 'button',
+        action: 'switchNarratorVoice(' + JSON.stringify(v) + ')',
+        style: {layout_flexBasisPercent: 0.5}
+      });
+    }
+
+    const keys = Object.keys(voiceMap).filter(k => k !== '未命名角色' && k !== '__narrator__');
+    if (!keys.length) {
+      ui.push({name: '还没有识别出角色，朗读一页后这里有各角色音色可切换', type: 'button', style: {layout_flexBasisPercent: 1.0}});
+    }
+    for (const identity of keys) {
+      const entry = voiceMap[identity];
+      const current = (typeof entry === 'string' ? entry : entry && entry.voice) || '';
+      const isOverride = entry && typeof entry === 'object' && !!entry.override;
+      const charGender = entry && typeof entry === 'object' ? (entry.gender || 'unknown') : 'unknown';
+      const label = identity;
+      ui.push({
+        name: (isOverride ? '[手动] ' : '') + label + '  →  ' + (current ? voiceLabel(current) : '未分配'),
+        type: 'button',
+        style: {layout_flexBasisPercent: 1.0, disabled: true}
+      });
+      // 优先展示符合角色性别的音色，unknown 时展示全部。
+      const genderVoices = charGender === 'female' || charGender === 'male'
+        ? Object.keys(VOICE_META).filter(v => VOICE_META[v].gender === charGender)
+        : Object.keys(VOICE_META);
+      for (const v of genderVoices) {
+        ui.push({
+          name: (current === v ? '★ ' : '') + voiceLabel(v),
+          type: 'button',
+          action: 'switchVoice(' + JSON.stringify(identity) + ',' + JSON.stringify(v) + ')',
+          style: {layout_flexBasisPercent: 0.5}
+        });
+      }
+      if (isOverride) {
+        ui.push({name: '↺ 恢复自动 ' + label, type: 'button', action: 'resetVoice(' + JSON.stringify(identity) + ')', style: {layout_flexBasisPercent: 1.0}});
+      }
+      ui.push({name: '—', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}});
+    }
+    ui.push({name: '关闭', type: 'button', action: 'getloginurl()', style: {layout_flexBasisPercent: 0.5}});
+    return JSON.stringify(ui);
   }
 
   function speedPercent(speechRate) {
@@ -1258,7 +1393,7 @@
     lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
-    await cache.remove('ai_speaker_voice_map_v4');
+    await cache.remove('ai_speaker_voice_map_v6');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
     await cache.remove('ai_character_roster_v6');
@@ -1281,6 +1416,7 @@
       {name: '测试并启用AI', type: 'button', action: 'testAndEnableAI()', style: {layout_flexBasisPercent: 0.5}},
       {name: '状态/当前模型', type: 'button', action: 'showAiStatus()', style: {layout_flexBasisPercent: 0.34}},
       {name: '停用AI', type: 'button', action: 'setAiEnabled(false)', style: {layout_flexBasisPercent: 0.33}},
+      {name: '音色管理', type: 'button', action: 'buildVoiceManagerUI()', style: {layout_flexBasisPercent: 0.34}},
       {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}}
     ];
     for (const model of models.slice(0, 30)) {
@@ -1306,5 +1442,9 @@
   window.setAiModel = setAiModel;
   window.showAiStatus = showAiStatus;
   window.testAndEnableAI = testAndEnableAI;
+  window.buildVoiceManagerUI = buildVoiceManagerUI;
+  window.switchVoice = switchVoice;
+  window.resetVoice = resetVoice;
+  window.switchNarratorVoice = switchNarratorVoice;
 </script>
 </html>
