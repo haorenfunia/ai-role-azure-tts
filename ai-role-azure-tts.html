@@ -108,7 +108,6 @@
     aiEndpoint: 'https://api.openai.com/v1/chat/completions',
     aiModel: 'gpt-4.1-mini',
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
-    azureRegion: 'eastasia',
     narratorVoice: 'zh-CN-XiaoxiaoNeural'
   };
 
@@ -156,11 +155,8 @@
       aiKey: String(info['AI密钥'] || '').trim(),
       aiModel: String(info['AI模型'] || DEFAULTS.aiModel).trim(),
       proxyEndpoint: String(info['TTS中转'] || DEFAULTS.proxyEndpoint).trim(),
-      azureRegion: String(info['Azure区域'] || DEFAULTS.azureRegion).trim(),
-      azureKey: String(info['Azure密钥'] || '').trim(),
       narratorVoice: String(info['旁白音色'] || DEFAULTS.narratorVoice).trim(),
-      aiEnabled: (await cache.get('ai_role_enabled')) !== 'false',
-      ttsMode: (await cache.get('tts_mode')) || 'proxy'
+      aiEnabled: (await cache.get('ai_role_enabled')) !== 'false'
     };
   }
 
@@ -343,15 +339,6 @@
     return 0;
   }
 
-  function escapeXml(value) {
-    return String(value || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&apos;');
-  }
-
   function buildProxyRequest(text, speechRate, voice, profile, settings) {
     const endpoint = settings.proxyEndpoint || DEFAULTS.proxyEndpoint;
     const separator = endpoint.includes('?') ? '&' : '?';
@@ -365,34 +352,6 @@
     return {method: 'get', url: url, headers: {}};
   }
 
-  function buildAzureRequest(text, speechRate, voice, profile, settings) {
-    if (!settings.azureKey) {
-      return buildProxyRequest(text, speechRate, voice, profile, settings);
-    }
-
-    const rate = speedPercent(speechRate);
-    const pitch = pitchFor(profile);
-    const ssml = [
-      '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="zh-CN">',
-      '<voice name="' + escapeXml(voice) + '">',
-      '<prosody rate="' + (rate >= 0 ? '+' : '') + rate + '%" pitch="' + (pitch >= 0 ? '+' : '') + pitch + 'Hz">',
-      escapeXml(text),
-      '</prosody></voice></speak>'
-    ].join('');
-
-    return {
-      method: 'post',
-      url: 'https://' + settings.azureRegion + '.tts.speech.microsoft.com/cognitiveservices/v1',
-      headers: {
-        'Ocp-Apim-Subscription-Key': settings.azureKey,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
-        'User-Agent': 'AI-Role-Reader'
-      },
-      body: ssml
-    };
-  }
-
   // 阅读 App 调用的核心入口，不可删除或改名。
   async function getttsurl(speakText, speechRate) {
     const text = String(speakText || '').trim();
@@ -403,9 +362,7 @@
     const recent = String((await cache.get('ai_recent_context')) || '');
     await cache.set('ai_recent_context', (recent + '\n' + text).slice(-800));
 
-    const request = settings.ttsMode === 'azure'
-      ? buildAzureRequest(text, speechRate, voice, profile, settings)
-      : buildProxyRequest(text, speechRate, voice, profile, settings);
+    const request = buildProxyRequest(text, speechRate, voice, profile, settings);
 
     await flutterBridge.log(
       'AI配音：' + profile.speaker + ' / ' + profile.gender + ' / ' + profile.age + ' / ' + voice
@@ -416,11 +373,6 @@
   async function setAiEnabled(enabled) {
     await cache.set('ai_role_enabled', enabled ? 'true' : 'false');
     await flutterBridge.showToast(enabled ? '已启用 AI 角色识别' : '已停用 AI，改用本地判断');
-  }
-
-  async function setTtsMode(mode) {
-    await cache.set('tts_mode', mode === 'azure' ? 'azure' : 'proxy');
-    await flutterBridge.showToast(mode === 'azure' ? '已切换官方 Azure F0' : '已切换免密 TTS 中转');
   }
 
   async function clearRoleCache() {
@@ -435,15 +387,9 @@
       {name: 'AI接口', type: 'text'},
       {name: 'AI密钥', type: 'password'},
       {name: 'AI模型', type: 'text'},
-      {name: 'TTS中转', type: 'text'},
-      {name: 'Azure区域', type: 'text'},
-      {name: 'Azure密钥', type: 'password'},
-      {name: '旁白音色', type: 'text'},
       {name: '启用AI', type: 'button', action: 'setAiEnabled(true)', style: {layout_flexBasisPercent: 0.33}},
       {name: '停用AI', type: 'button', action: 'setAiEnabled(false)', style: {layout_flexBasisPercent: 0.33}},
-      {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}},
-      {name: '免密中转', type: 'button', action: "setTtsMode('proxy')", style: {layout_flexBasisPercent: 0.5}},
-      {name: '官方Azure', type: 'button', action: "setTtsMode('azure')", style: {layout_flexBasisPercent: 0.5}}
+      {name: '清空角色', type: 'button', action: 'clearRoleCache()', style: {layout_flexBasisPercent: 0.33}}
     ];
     return JSON.stringify(ui);
   }
@@ -455,7 +401,6 @@
   window.getloginurl = getloginurl;
   window.login = login;
   window.setAiEnabled = setAiEnabled;
-  window.setTtsMode = setTtsMode;
   window.clearRoleCache = clearRoleCache;
 </script>
 </html>
