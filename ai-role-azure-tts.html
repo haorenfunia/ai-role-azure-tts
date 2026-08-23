@@ -736,9 +736,13 @@
     const sameAsPrevious = line.same_as_previous ?? line['承接上一句'] ?? line['与上一句同一人'];
     const namedInsideDialogue = profile.speaker && String(item.text || '').includes(profile.speaker) &&
       !/(?:我是|我叫|名字叫)/.test(String(item.text || ''));
-    const unknownNewSpeaker = profile.speaker && profile.speaker !== previousProfile.speaker && !roster[profile.speaker];
-    const shouldContinue = sameAsPrevious === true || namedInsideDialogue ||
-      (sameAsPrevious !== false && (isGenericSpeaker(profile.speaker) || namedInsideDialogue || unknownNewSpeaker));
+    // 只有当 AI 没有明确点出具体说话人（speaker 是泛称或不由本次识别时），
+    // 才允许沿用前一条的角色；AI 明确叫出具体人名（如“白真真”）时尊重 AI，
+    // 绝不因为缺少“某某说”就把它并进前文角色。
+    const hasConcreteName = profile.speaker && !isGenericSpeaker(profile.speaker) &&
+      profile.speaker !== previousProfile.speaker;
+    const shouldContinue = sameAsPrevious === true ||
+      (sameAsPrevious !== false && !hasConcreteName && (isGenericSpeaker(profile.speaker) || namedInsideDialogue));
     if (!shouldContinue) return profile;
     return {
       type: 'dialogue',
