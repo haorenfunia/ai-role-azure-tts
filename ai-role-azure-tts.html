@@ -689,6 +689,11 @@
       !hasStrictChildEvidence(line.age_evidence || line['年龄依据'])) {
       profile.age = known && known.age ? known.age : 'unknown';
     }
+    // 仅凭姓名推测的性别可信度较低，降低置信度，避免过早锁死角色档案。
+    const genderEvidence = String(line.gender_evidence || line['性别依据'] || '');
+    if (/姓名推测/.test(genderEvidence) && !(known && known.gender && known.gender !== 'unknown')) {
+      profile.confidence = Math.min(Number(profile.confidence || 0.5), 0.6);
+    }
     return profile;
   }
 
@@ -804,14 +809,14 @@
       }
     }
     const cacheContext = previousProfile ? previousProfile.speaker : '';
-    const cacheKey = 'ai_cast_v7_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v8_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v4'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v5'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
@@ -827,6 +832,7 @@
     const prompt = [
       '你是中文小说配音助手，只分析当前几个相邻小段，不做整章分析。旁白无需分配角色。',
       '请判断每条对白是谁说的，并推断性别、年龄层和当前情绪。相同角色必须使用相同 speaker 名称。',
+      '性别判断规则：优先使用上下文线索（他/她、称谓等）；上下文没有明确线索时，可根据姓名本身判断大概率性别（例如“白真真”“李婉婷”大概率是女性，“王铁柱”“张建国”大概率是男性），此时在 gender_evidence 中写“姓名推测”；姓名无明显性别倾向或纯属代称时才返回 unknown。',
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
       '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
@@ -834,7 +840,7 @@
       '必须在 age_evidence 中写出剧情里的年龄依据；没有明确依据就返回 unknown，严禁仅凭语气、称呼别人为孩子或一句话内容判断为 child。',
       '同时判断本段旁白氛围和每条对白的情绪。emotion 只能是 neutral|calm|happy|sad|angry|nervous|excited|serious|tender，intensity 为0到1；不确定时使用 neutral 和0.3，禁止夸张。',
       '只返回严格 JSON：',
-      '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
+      '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","gender_evidence":"原文依据或姓名推测或无","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
       '最近已确认的对白角色：' + JSON.stringify(compactHistory),
@@ -903,7 +909,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v4', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v5', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -1251,7 +1257,7 @@
     await cache.remove('ai_speaker_voice_map_v4');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
-    await cache.remove('ai_character_roster_v4');
+    await cache.remove('ai_character_roster_v5');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await cache.remove('ai_chapter_memory_v4');
