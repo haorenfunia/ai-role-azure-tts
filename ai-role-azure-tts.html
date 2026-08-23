@@ -381,6 +381,65 @@
     return raw;
   }
 
+  function parseAiPayload(content) {
+    let raw = String(content || '').trim();
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) raw = fenced[1].trim();
+    try {
+      return JSON.parse(raw);
+    } catch (error) {}
+
+    const objectStart = raw.indexOf('{');
+    const arrayStart = raw.indexOf('[');
+    const useArray = arrayStart >= 0 && (objectStart < 0 || arrayStart < objectStart);
+    const start = useArray ? arrayStart : objectStart;
+    const end = useArray ? raw.lastIndexOf(']') : raw.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(raw.slice(start, end + 1));
+      } catch (error) {}
+    }
+    return null;
+  }
+
+  function normalizeAiAnalysis(payload) {
+    let value = payload;
+    for (let depth = 0; depth < 3; depth++) {
+      if (typeof value === 'string') value = parseAiPayload(value);
+      if (!value || Array.isArray(value)) break;
+      const wrapped = value.result || value.data || value.analysis || value.output;
+      if (!wrapped || wrapped === value) break;
+      if (value.lines || value.dialogues || value.results || value.items) break;
+      value = wrapped;
+    }
+
+    let lines;
+    let narration = {};
+    if (Array.isArray(value)) {
+      lines = value;
+    } else if (value && typeof value === 'object') {
+      narration = value.narration || value.narrator || value.prosody || {};
+      lines = value.lines || value.dialogues || value.dialogue || value.results ||
+        value.items || value.characters || value.roles;
+      if (!lines && (value.speaker || value.role || value.gender || value.age)) lines = [value];
+      if (!lines) {
+        const numericKeys = Object.keys(value).filter(key => /^\d+$/.test(key));
+        if (numericKeys.length) lines = numericKeys.sort((a, b) => Number(a) - Number(b)).map(key => value[key]);
+      }
+    }
+
+    if (lines && !Array.isArray(lines) && typeof lines === 'object') lines = Object.values(lines);
+    if (!Array.isArray(lines)) return null;
+    return {
+      narration: narration,
+      lines: lines.map((item, index) => ({
+        ...(item && item.profile ? item.profile : {}),
+        ...(item || {}),
+        id: Number(item && (item.id || item.line_id || item.index)) || index + 1
+      }))
+    };
+  }
+
   function normalizeGender(value) {
     const text = String(value || '').toLowerCase();
     if (text === 'male' || text.includes('男')) return 'male';
@@ -660,7 +719,7 @@
     const body = {
       model: settings.aiModel,
       temperature: 0,
-      max_tokens: 420,
+      max_tokens: Math.min(1800, Math.max(600, dialogues.length * 180)),
       response_format: {type: 'json_object'},
       messages: [
         {role: 'system', content: '你只输出严格 JSON，保持角色名称稳定。'},
@@ -674,8 +733,8 @@
         AI_ANALYSIS_TIMEOUT,
         'AI分析超过15秒'
       );
-      const parsed = parseObject(stripJsonFence(content), null);
-      if (!parsed || !Array.isArray(parsed.lines)) throw new Error('AI 返回缺少 lines');
+      const parsed = normalizeAiAnalysis(parseAiPayload(content));
+      if (!parsed || !parsed.lines.length) throw new Error('AI返回格式无法识别');
 
       const profiles = {};
       for (const item of dialogues) {
