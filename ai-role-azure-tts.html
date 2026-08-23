@@ -711,7 +711,7 @@
 
     return {
       type: 'dialogue',
-      speaker: nearbySpeaker,
+      speaker: sanitizeSpeaker(nearbySpeaker),
       gender: gender,
       age: age,
       confidence: 0.35
@@ -766,6 +766,20 @@
       profile.confidence = Math.min(Number(profile.confidence || 0.5), 0.6);
     }
     return profile;
+  }
+
+  // 过滤明显不是人名的 speaker（AI 或本地判断把短语误认成说话人时回退为未命名）。
+  const NON_NAME_PATTERN = /(说道|说道|道|说|问|喊|答|叫|叹|感叹|坦言|解释|回应|补充|继续|接着|突然|随即|于是|然后|但是|因为|所以|只见|这时|此刻|理所当然|理应|应当|应该|自然|似乎|仿佛|好像|一边|一面|顿了顿|沉默|片刻|良久|低声|轻声|大声|高声|笑着|哭着|气愤|激动|淡淡|冷冷|平静|缓缓|焦急|慌张|急切|认真|温和|轻声地|低声道|如此|一个|一位|这个|那个|只见|来了|走去|走来|说完|说罢|说罢)/;
+  function sanitizeSpeaker(speaker) {
+    const value = String(speaker || '').trim();
+    if (!value || isGenericSpeaker(value)) return '未命名角色';
+    // 超过4个汉字基本不是人名。
+    if (value.length > 4) return '未命名角色';
+    // 含说话动词/副词/连词等明显非人名成分，或整个就是语气词。
+    if (NON_NAME_PATTERN.test(value)) return '未命名角色';
+    // 末字为常见动词性字（叹/道/说/问等）判定为误抓。
+    if (/[叹道说问喊答叫]$/.test(value)) return '未命名角色';
+    return value;
   }
 
   function canonicalSpeakerName(speaker, roster) {
@@ -967,6 +981,8 @@
         if (explicitSpeaker && !isGenericSpeaker(explicitSpeaker)) {
           profile.speaker = explicitSpeaker;
         }
+        // 过滤“刚山感叹”“理所应当”这类被误认成说话人的短语。
+        profile.speaker = sanitizeSpeaker(profile.speaker);
         profile.speaker = canonicalSpeakerName(profile.speaker, roster);
         profile = stabilizeCharacterProfile(profile, line, roster);
         profile = keepPreviousSpeaker(profile, line, item, previousProfile, roster);
@@ -1030,7 +1046,7 @@
       return narratorOverride || settings.narratorVoice;
     }
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v6'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v7'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
@@ -1052,13 +1068,13 @@
       }
     }
     voiceMap[identity] = {voice: voice, gender: profile.gender, age: profile.age};
-    await cache.set('ai_speaker_voice_map_v6', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v7', JSON.stringify(voiceMap));
     return voice;
   }
 
   // 手动给某个角色指定音色，写入 voice map 并标记为 override（最高优先级）。
   async function switchVoice(identity, voice) {
-    const key = 'ai_speaker_voice_map_v6';
+    const key = 'ai_speaker_voice_map_v7';
     const voiceMap = parseObject(await cache.get(key), {});
     const existing = voiceMap[identity];
     const savedGender = existing && typeof existing === 'object' ? (existing.gender || 'unknown') : 'unknown';
@@ -1073,7 +1089,7 @@
 
   // 移除某个角色的手动指定，恢复自动分配。
   async function resetVoice(identity) {
-    const key = 'ai_speaker_voice_map_v6';
+    const key = 'ai_speaker_voice_map_v7';
     const voiceMap = parseObject(await cache.get(key), {});
     const entry = voiceMap[identity];
     if (entry && typeof entry === 'object') {
@@ -1105,7 +1121,7 @@
 
   // 生成音色管理面板的 JSON UI（从 voice map 列出各角色当前音色并提供切换）。
   async function buildVoiceManagerUI() {
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v6'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v7'), {});
     const ui = [
       {name: '配音音色管理', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}},
       {name: '旁白音色：' + voiceLabel(await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice), type: 'text'}
@@ -1121,7 +1137,12 @@
       });
     }
 
-    const keys = Object.keys(voiceMap).filter(k => k !== '未命名角色' && k !== '__narrator__');
+    // 只展示像名字的角色或泛称（未命名角色|性别|年龄），过滤误抓的短语。
+    const keys = Object.keys(voiceMap).filter(k => {
+      if (k === '未命名角色' || k === '__narrator__') return false;
+      if (k.includes('|')) return k.startsWith('未命名角色');
+      return sanitizeSpeaker(k) !== '未命名角色';
+    });
     if (!keys.length) {
       ui.push({name: '还没有识别出角色，朗读一页后这里有各角色音色可切换', type: 'button', style: {layout_flexBasisPercent: 1.0}});
     }
@@ -1440,7 +1461,7 @@
     lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
-    await cache.remove('ai_speaker_voice_map_v6');
+    await cache.remove('ai_speaker_voice_map_v7');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
     await cache.remove('ai_character_roster_v7');
