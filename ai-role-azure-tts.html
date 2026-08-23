@@ -222,7 +222,10 @@
   function normalizeEndpoint(endpoint) {
     let url = String(endpoint || '').trim().replace(/\/+$/, '');
     if (!url) return DEFAULTS.aiEndpoint;
+    // 已是指定 chat/completions 或类 OpenAI 的 /v1 结尾，直接用。
     if (/\/chat\/completions$/i.test(url)) return url;
+    // minimax 使用 /v1/text/chatcompletion_v2 这类非标准路径，不要再拼接。
+    if (/minimax/i.test(url) || /chatcompletion/i.test(url) || /text\/chat/i.test(url)) return url;
     if (/\/v1$/i.test(url)) return url + '/chat/completions';
     return url + '/v1/chat/completions';
   }
@@ -231,6 +234,7 @@
     let url = String(endpoint || '').trim().replace(/\/+$/, '');
     if (!url) return 'https://api.openai.com/v1/models';
     url = url.replace(/\/chat\/completions$/i, '');
+    if (/minimax/i.test(url) || /chatcompletion/i.test(url)) return url + '/models';
     if (/\/v1$/i.test(url)) return url + '/models';
     return url + '/v1/models';
   }
