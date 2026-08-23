@@ -130,6 +130,8 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
+  const AI_ANALYSIS_TIMEOUT = 8000;
+  const ANALYSIS_BATCH_DELAY = 60;
 
   const VOICE_POOLS = {
     female: {
@@ -249,6 +251,20 @@
       : payload.output_text;
     if (!content) throw new Error(responseError(response, payload));
     return content;
+  }
+
+  async function withTimeout(promise, milliseconds, message) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), milliseconds);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function fetchAiModels() {
@@ -382,6 +398,24 @@
     return 'unknown';
   }
 
+  function normalizeEmotion(value) {
+    const text = String(value || '').toLowerCase();
+    const allowed = ['neutral', 'calm', 'happy', 'sad', 'angry', 'nervous', 'excited', 'serious', 'tender'];
+    return allowed.includes(text) ? text : 'neutral';
+  }
+
+  function normalizeIntensity(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : 0.35;
+  }
+
+  function normalizeProsody(result) {
+    return {
+      emotion: normalizeEmotion(result && result.emotion),
+      intensity: normalizeIntensity(result && result.intensity)
+    };
+  }
+
   function splitSpeechSegments(text) {
     const pairs = {'“': '”', '「': '」', '『': '』', '"': '"'};
     const result = [];
@@ -460,11 +494,14 @@
 
   function normalizeDialogueProfile(result, fallback) {
     const speaker = String(result.speaker || result.role || '').trim();
+    const prosody = normalizeProsody(result);
     return {
       type: 'dialogue',
       speaker: speaker || fallback.speaker,
       gender: normalizeGender(result.gender || fallback.gender),
       age: normalizeAge(result.age || result.age_group || fallback.age),
+      emotion: prosody.emotion,
+      intensity: prosody.intensity,
       confidence: Number(result.confidence || fallback.confidence || 0)
     };
   }
@@ -524,6 +561,8 @@
       speaker: previousProfile.speaker,
       gender: previousProfile.gender,
       age: previousProfile.age,
+      emotion: profile.emotion,
+      intensity: profile.intensity,
       confidence: Math.max(Number(profile.confidence || 0), Number(previousProfile.confidence || 0))
     };
   }
@@ -568,8 +607,8 @@
     if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
 
     const chapterMemory = await readChapterMemory(text);
-    const recent = chapterMemory.text.slice(-16000);
-    const dialogueHistory = chapterMemory.dialogues.slice(-30);
+    const recent = chapterMemory.text.slice(-6000);
+    const dialogueHistory = chapterMemory.dialogues.slice(-18);
     let previousProfile = dialogueHistory.length ? dialogueHistory[dialogueHistory.length - 1] : null;
     const cacheContext = previousProfile ? previousProfile.speaker + '|' + recent.slice(-500) : recent.slice(-500);
     const cacheKey = 'ai_cast_v5_' + hashText(text + '|' + cacheContext);
@@ -589,8 +628,9 @@
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
       '年龄必须按角色实际年龄判断：child=0至12岁，teen=13至17岁，young=18至35岁，middle=36至59岁，senior=60岁以上。',
       '必须在 age_evidence 中写出剧情里的年龄依据；没有明确依据就返回 unknown，严禁仅凭语气、称呼别人为孩子或一句话内容判断为 child。',
+      '同时判断本段旁白氛围和每条对白的情绪。emotion 只能是 neutral|calm|happy|sad|angry|nervous|excited|serious|tender，intensity 为0到1；不确定时使用 neutral 和0.3，禁止夸张。',
       '只返回严格 JSON：',
-      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","same_as_previous":false,"confidence":0.0}]}',
+      '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
       '本章已读剧情：' + (recent || '无'),
@@ -615,7 +655,11 @@
     };
 
     try {
-      const content = await requestAiChat(settings, body);
+      const content = await withTimeout(
+        requestAiChat(settings, body),
+        AI_ANALYSIS_TIMEOUT,
+        'AI分析超过8秒'
+      );
       const parsed = parseObject(stripJsonFence(content), null);
       if (!parsed || !Array.isArray(parsed.lines)) throw new Error('AI 返回缺少 lines');
 
@@ -641,6 +685,7 @@
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
       await cache.set('ai_character_roster_v3', JSON.stringify(roster));
+      profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
       return profiles;
@@ -693,10 +738,35 @@
     return Math.max(-50, Math.min(100, Math.round((number - 10) * 10)));
   }
 
+  function emotionAdjustment(profile) {
+    const intensity = normalizeIntensity(profile && profile.intensity);
+    const adjustments = {
+      neutral: {rate: 0, pitch: 0},
+      calm: {rate: -3, pitch: 0},
+      happy: {rate: 3, pitch: 1},
+      sad: {rate: -4, pitch: -1},
+      angry: {rate: 4, pitch: 1},
+      nervous: {rate: 3, pitch: 0},
+      excited: {rate: 5, pitch: 1},
+      serious: {rate: -2, pitch: -1},
+      tender: {rate: -3, pitch: 0}
+    };
+    const value = adjustments[normalizeEmotion(profile && profile.emotion)] || adjustments.neutral;
+    return {
+      rate: Math.round(value.rate * intensity),
+      pitch: Math.round(value.pitch * intensity)
+    };
+  }
+
+  function rateFor(profile, speechRate) {
+    return Math.max(-50, Math.min(100, speedPercent(speechRate) + emotionAdjustment(profile).rate));
+  }
+
   function pitchFor(profile) {
-    if (profile.age === 'child') return 2;
-    if (profile.age === 'senior') return -2;
-    return 0;
+    let pitch = 0;
+    if (profile.age === 'child') pitch = 2;
+    if (profile.age === 'senior') pitch = -2;
+    return Math.max(-8, Math.min(8, pitch + emotionAdjustment(profile).pitch));
   }
 
   function buildProxyRequest(text, speechRate, voice, profile, settings) {
@@ -705,7 +775,7 @@
     const url = endpoint + separator + [
       't=' + encodeURIComponent(text),
       'v=' + encodeURIComponent(voice),
-      'r=' + speedPercent(speechRate),
+      'r=' + rateFor(profile, speechRate),
       'p=' + pitchFor(profile)
     ].join('&');
 
@@ -749,11 +819,14 @@
 
   async function fetchAudioPart(item, speechRate, settings) {
     const request = buildProxyRequest(item.text, speechRate, item.voice, item.profile, settings);
-    const response = await http.Get(request.url, {}, true);
-    if (!response || Number(response.statusCode || 200) >= 400 || !response.body) {
-      throw new Error('微软音频请求失败');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await http.Get(request.url, {}, true);
+      if (response && Number(response.statusCode || 200) < 400 && response.body) {
+        return base64ToBytes(response.body);
+      }
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 250));
     }
-    return base64ToBytes(response.body);
+    throw new Error('微软音频请求失败');
   }
 
   async function buildMultiVoiceRequest(rendered, speechRate, settings, originalText) {
@@ -761,7 +834,9 @@
     for (const item of rendered) {
       if (!item.text) continue;
       const previous = merged[merged.length - 1];
-      if (previous && previous.voice === item.voice && pitchFor(previous.profile) === pitchFor(item.profile)) {
+      if (previous && previous.voice === item.voice &&
+        pitchFor(previous.profile) === pitchFor(item.profile) &&
+        rateFor(previous.profile, speechRate) === rateFor(item.profile, speechRate)) {
         previous.text += item.text;
       } else {
         merged.push({...item});
@@ -788,8 +863,74 @@
     }
   }
 
-  // 轻阅时光会并行预取多段；角色分析必须串行，才能可靠继承上一段说话人。
-  let roleAnalysisQueue = Promise.resolve();
+  // 把轻阅时光同时预取的小段合并成一次 AI 请求，减少排队和超时。
+  let pendingRoleBatch = [];
+  let roleBatchTimer = null;
+  let roleBatchBusy = false;
+
+  function scheduleRolePreparation(text, segments, settings) {
+    return new Promise((resolve, reject) => {
+      pendingRoleBatch.push({text: text, segments: segments, settings: settings, resolve: resolve, reject: reject});
+      if (!roleBatchBusy && !roleBatchTimer) {
+        roleBatchTimer = setTimeout(flushRoleBatch, settings.aiEnabled ? ANALYSIS_BATCH_DELAY : 0);
+      }
+    });
+  }
+
+  async function flushRoleBatch() {
+    roleBatchTimer = null;
+    if (roleBatchBusy || !pendingRoleBatch.length) return;
+    roleBatchBusy = true;
+    const batch = pendingRoleBatch.splice(0, pendingRoleBatch.length);
+
+    try {
+      const combinedText = batch.map(item => item.text).join('\n');
+      const combinedSegments = [];
+      for (let index = 0; index < batch.length; index++) {
+        if (index) combinedSegments.push({type: 'narrator', text: '〔段落分隔〕'});
+        combinedSegments.push(...batch[index].segments);
+      }
+      const dialogueProfiles = await analyzeDialoguesWithAI(combinedText, combinedSegments, batch[0].settings);
+      if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
+        await cache.set('ai_working_notice', 'true');
+        await cache.remove('ai_last_read_error');
+        await flutterBridge.showToast('AI角色识别正在工作');
+      }
+
+      let dialogueId = 0;
+      for (const item of batch) {
+        const rendered = [];
+        for (const segment of item.segments) {
+          let profile;
+          if (segment.type === 'dialogue') {
+            dialogueId += 1;
+            profile = dialogueProfiles[dialogueId] || {
+              type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown', emotion: 'neutral', intensity: 0.3
+            };
+          } else {
+            profile = {
+              type: 'narrator', speaker: '旁白', gender: 'male', age: 'young',
+              ...normalizeProsody(dialogueProfiles._narration)
+            };
+          }
+          rendered.push({
+            text: segment.text,
+            profile: profile,
+            voice: await resolveVoice(profile, item.settings)
+          });
+        }
+        await updateChapterMemory(item.text, rendered, dialogueProfiles._source);
+        item.resolve(rendered);
+      }
+    } catch (error) {
+      batch.forEach(item => item.reject(error));
+    } finally {
+      roleBatchBusy = false;
+      if (pendingRoleBatch.length && !roleBatchTimer) {
+        roleBatchTimer = setTimeout(flushRoleBatch, ANALYSIS_BATCH_DELAY);
+      }
+    }
+  }
 
   // 阅读 App 调用的核心入口，不可删除或改名。
   async function getttsurl(speakText, speechRate) {
@@ -803,38 +944,7 @@
         await flutterBridge.showToast('AI尚未测试启用，当前使用本地角色判断');
       }
     }
-    const preparation = roleAnalysisQueue.then(async () => {
-      const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
-      if (dialogueProfiles._source === 'ai' && !(await cache.get('ai_working_notice'))) {
-        await cache.set('ai_working_notice', 'true');
-        await cache.remove('ai_last_read_error');
-        await flutterBridge.showToast('AI角色识别正在工作');
-      }
-      const rendered = [];
-      let dialogueId = 0;
-
-      for (const segment of segments) {
-        let profile;
-        if (segment.type === 'dialogue') {
-          dialogueId += 1;
-          profile = dialogueProfiles[dialogueId] || {
-            type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown'
-          };
-        } else {
-          profile = {type: 'narrator', speaker: '旁白', gender: 'unknown', age: 'unknown'};
-        }
-        rendered.push({
-          text: segment.text,
-          profile: profile,
-          voice: await resolveVoice(profile, settings)
-        });
-      }
-
-      await updateChapterMemory(text, rendered, dialogueProfiles._source);
-      return rendered;
-    });
-    roleAnalysisQueue = preparation.then(() => undefined, () => undefined);
-    const rendered = await preparation;
+    const rendered = await scheduleRolePreparation(text, segments, settings);
 
     await flutterBridge.log(
       '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
