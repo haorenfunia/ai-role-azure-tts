@@ -722,11 +722,16 @@
     const speaker = String(result.speaker || result.role || result.name ||
       result['角色'] || result['说话人'] || result['人物'] || result['姓名'] || '').trim();
     const prosody = normalizeProsody(result);
+    // 当 AI 明确点出说话人时，性别不再沿用 fallback（可能是上一句角色），
+    // 交由其后的 roster（角色表）权威修正；否则保留 fallback 作续话兜底。
+    const aiNamedSpeaker = !!speaker;
     return {
       type: 'dialogue',
       speaker: speaker || fallback.speaker,
-      gender: normalizeGender(result.gender || result.sex || result['性别'] || fallback.gender),
-      age: normalizeAge(result.age || result.age_group || result['年龄'] || result['年龄段'] || fallback.age),
+      gender: normalizeGender(result.gender || result.sex || result['性别'] ||
+        (aiNamedSpeaker ? '' : fallback.gender)),
+      age: normalizeAge(result.age || result.age_group || result['年龄'] || result['年龄段'] ||
+        (aiNamedSpeaker ? '' : fallback.age)),
       emotion: prosody.emotion,
       intensity: prosody.intensity,
       confidence: Number(result.confidence || fallback.confidence || 0)
@@ -745,6 +750,11 @@
     if (known) {
       if (known.gender && known.gender !== 'unknown') profile.gender = known.gender;
       if (known.age && known.age !== 'unknown') profile.age = known.age;
+    }
+    // AI 与角色表都没给出性别时，用中文姓名特征兜底（如“白真真”→女）。
+    if (profile.gender === 'unknown' && profile.speaker && !isGenericSpeaker(profile.speaker)) {
+      const nameGender = guessNameGender(profile.speaker);
+      if (nameGender !== 'unknown') profile.gender = nameGender;
     }
     if (profile.age === 'child' && !(known && known.age === 'child') &&
       !hasStrictChildEvidence(line.age_evidence || line['年龄依据'])) {
@@ -874,14 +884,14 @@
       }
     }
     const cacheContext = previousProfile ? previousProfile.speaker : '';
-    const cacheKey = 'ai_cast_v9_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v10_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v6'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v7'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
@@ -901,6 +911,7 @@
       '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
       '重点判断当前对白是否承接上一条对白。同一个人连续说多段引号内容时，same_as_previous 必须为 true，并沿用上一条 speaker。',
       '对白里提到的人名不一定是说话人。例如“张羽没有训练”不能据此认定张羽正在说话。只有明确换人或上下文确实轮到另一角色时才更换 speaker。',
+      '原文不一定会写“某某说”。即使没有说/道等动词，也要结合上下文（谁在场、上一句是谁、动作与剧情）推断本句是谁说的，并在对应 speaker 上给出该角色的性别。只要说话人是确定角色（如张羽），gender 就必须与该角色一致，严禁沿袭上一句不同角色的性别。',
       '年龄必须按角色实际年龄判断：child=0至12岁，teen=13至17岁，young=18至35岁，middle=36至59岁，senior=60岁以上。',
       '必须在 age_evidence 中写出剧情里的年龄依据；没有明确依据就返回 unknown，严禁仅凭语气、称呼别人为孩子或一句话内容判断为 child。',
       '同时判断本段旁白氛围和每条对白的情绪。emotion 只能是 neutral|calm|happy|sad|angry|nervous|excited|serious|tender，intensity 为0到1；不确定时使用 neutral 和0.3，禁止夸张。',
@@ -974,7 +985,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v6', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v7', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -1432,7 +1443,7 @@
     await cache.remove('ai_speaker_voice_map_v6');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
-    await cache.remove('ai_character_roster_v6');
+    await cache.remove('ai_character_roster_v7');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await cache.remove('ai_chapter_memory_v4');
