@@ -414,7 +414,7 @@
     const vKeys = Object.keys(voiceMap).filter(k => k !== '__narrator__');
 
     const parts = [];
-    parts.push('【福尼亚朗读引擎诊断】v2026-08-24(缓存v12/9/9)');
+    parts.push('【福尼亚朗读引擎诊断】v2026-08-24(缓存v13/10/10)');
     parts.push('AI启用:' + (enabled === 'true' ? '是' : '否') + ' 模型:' + (settings.aiModel || '未选'));
     parts.push('接口:' + endpoint);
     parts.push('密钥:' + (settings.aiKey ? '已填(尾' + settings.aiKey.slice(-4) + ')' : '未填') +
@@ -1022,8 +1022,9 @@
     const cacheKey = 'ai_cast_v13_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
-      cached._source = 'ai';
-      await appLog('命中AI缓存(' + cacheKey.slice(0, 12) + ')，直接使用已识别结果');
+      // 保留缓存里真实的来源标记（ai 或 local），别把缓存命中都标成 ai。
+      if (!cached._source) cached._source = cached._source === 'local' ? 'local' : 'ai';
+      await appLog('命中缓存(' + cacheKey.slice(0, 12) + ')，来源' + cached._source);
       return cached;
     }
     const roster = parseObject(await cache.get('ai_character_roster_v10'), {});
@@ -1147,6 +1148,11 @@
         await cache.set('ai_last_read_error', error.message);
         await flutterBridge.log('AI识别暂不可用：' + error.message);
       }
+      // 把本地兜底结果也缓存，避免同一段每次重读都再次卡满超时时间。
+      try {
+        fallbacks._source = 'local';
+        await cache.set(cacheKey, JSON.stringify(fallbacks));
+      } catch (e) {}
       return fallbacks;
     }
   }
