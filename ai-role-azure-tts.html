@@ -51,6 +51,22 @@
   }
 
   class Http {
+    async Get(url, headers, followRedirects) {
+      try {
+        return await window.flutter_inappwebview.callHandler(
+          'http',
+          'get',
+          url,
+          '',
+          JSON.stringify(headers || {}),
+          followRedirects !== false,
+          ''
+        );
+      } catch (error) {
+        return null;
+      }
+    }
+
     async Post(url, headers, body, contentType, followRedirects) {
       try {
         return await window.flutter_inappwebview.callHandler(
@@ -205,34 +221,86 @@
     return 'unknown';
   }
 
-  function localClassify(text) {
-    const value = String(text || '');
-    const hasDialogue = /[“”「」『』]|(?:^|[，。！？]\s*)[^，。！？]{1,12}[：:]/.test(value);
+  function splitSpeechSegments(text) {
+    const pairs = {'“': '”', '「': '」', '『': '』', '"': '"'};
+    const result = [];
+    let type = 'narrator';
+    let closing = '';
+    let buffer = '';
+
+    function pushBuffer() {
+      const value = buffer.trim();
+      if (value) result.push({type: type, text: value});
+      buffer = '';
+    }
+
+    for (const char of String(text || '')) {
+      if (type === 'narrator' && pairs[char]) {
+        pushBuffer();
+        type = 'dialogue';
+        closing = pairs[char];
+      } else if (type === 'dialogue' && char === closing) {
+        pushBuffer();
+        type = 'narrator';
+        closing = '';
+      } else {
+        buffer += char;
+      }
+    }
+    pushBuffer();
+
+    const merged = [];
+    for (const item of result) {
+      const previous = merged[merged.length - 1];
+      if (previous && previous.type === item.type) previous.text += item.text;
+      else merged.push(item);
+    }
+    return merged.length ? merged : [{type: 'narrator', text: String(text || '').trim()}];
+  }
+
+  function inferSpeaker(context) {
+    const value = String(context || '');
+    const pattern = /([\u4e00-\u9fa5]{1,4})(?:急忙|轻声|低声|大声|冷冷地|笑着|哭着|突然)?(?:说道|说|问道|问|喊道|喊|答道|答|叫道|叫|道)/g;
+    let match;
+    let speaker = '';
+    while ((match = pattern.exec(value))) speaker = match[1];
+    if (/^(她|女孩|姑娘|女子)$/.test(speaker)) return '女性角色';
+    if (/^(他|男孩|男人|男子)$/.test(speaker)) return '男性角色';
+    return speaker || '未命名角色';
+  }
+
+  function localDialogueProfile(segment, segments, index) {
+    const before = segments[index - 1] && segments[index - 1].type === 'narrator'
+      ? segments[index - 1].text.slice(-100)
+      : '';
+    const after = segments[index + 1] && segments[index + 1].type === 'narrator'
+      ? segments[index + 1].text.slice(0, 100)
+      : '';
+    const context = before + ' ' + segment.text + ' ' + after;
     let gender = 'unknown';
     let age = 'unknown';
 
-    if (/她|姑娘|小姐|女士|母亲|妈妈|姐姐|妹妹|妻子|奶奶|婆婆/.test(value)) gender = 'female';
-    if (/他|男人|先生|父亲|爸爸|哥哥|弟弟|丈夫|爷爷|老头/.test(value)) gender = 'male';
-    if (/婴儿|幼儿|小朋友|小孩|孩子|童声/.test(value)) age = 'child';
-    else if (/少年|少女|中学生|十[三四五六七八九]岁/.test(value)) age = 'teen';
-    else if (/老人|老者|爷爷|奶奶|老头|老太/.test(value)) age = 'senior';
-    else if (/中年|大叔|阿姨|父亲|母亲/.test(value)) age = 'middle';
-    else if (hasDialogue) age = 'young';
+    if (/她|姑娘|小姐|女士|母亲|妈妈|姐姐|妹妹|妻子|奶奶|婆婆/.test(context)) gender = 'female';
+    if (/他|男人|先生|父亲|爸爸|哥哥|弟弟|丈夫|爷爷|老头/.test(context)) gender = 'male';
+    if (/婴儿|幼儿|小朋友|小孩|孩子|童声/.test(context)) age = 'child';
+    else if (/少年|少女|中学生|十[三四五六七八九]岁/.test(context)) age = 'teen';
+    else if (/老人|老者|爷爷|奶奶|老头|老太/.test(context)) age = 'senior';
+    else if (/中年|大叔|阿姨|父亲|母亲/.test(context)) age = 'middle';
+    else age = 'young';
 
     return {
-      type: hasDialogue ? 'dialogue' : 'narrator',
-      speaker: hasDialogue ? '未命名角色' : '旁白',
+      type: 'dialogue',
+      speaker: inferSpeaker(after + ' ' + before),
       gender: gender,
       age: age,
       confidence: 0.35
     };
   }
 
-  function normalizeClassification(result, fallback) {
-    const typeText = String(result.type || result.kind || '').toLowerCase();
+  function normalizeDialogueProfile(result, fallback) {
     const speaker = String(result.speaker || result.role || '').trim();
     return {
-      type: typeText === 'dialogue' || typeText.includes('对话') ? 'dialogue' : fallback.type,
+      type: 'dialogue',
       speaker: speaker || fallback.speaker,
       gender: normalizeGender(result.gender || fallback.gender),
       age: normalizeAge(result.age || result.age_group || fallback.age),
@@ -240,28 +308,48 @@
     };
   }
 
-  async function classifyWithAI(text, settings) {
-    const fallback = localClassify(text);
-    if (!settings.aiEnabled || !settings.aiKey) return fallback;
+  async function analyzeDialoguesWithAI(text, segments, settings) {
+    const dialogues = [];
+    const fallbacks = {};
+    segments.forEach((segment, index) => {
+      if (segment.type !== 'dialogue') return;
+      const id = dialogues.length + 1;
+      const before = segments[index - 1] && segments[index - 1].type === 'narrator'
+        ? segments[index - 1].text.slice(-120)
+        : '';
+      const after = segments[index + 1] && segments[index + 1].type === 'narrator'
+        ? segments[index + 1].text.slice(0, 120)
+        : '';
+      dialogues.push({id: id, text: segment.text, before: before, after: after, segmentIndex: index});
+      fallbacks[id] = localDialogueProfile(segment, segments, index);
+    });
 
-    const cacheKey = 'ai_role_' + hashText(text);
+    if (!dialogues.length) return {};
+    if (!settings.aiEnabled || !settings.aiKey) return fallbacks;
+
+    const cacheKey = 'ai_cast_v2_' + hashText(text);
     const cached = parseObject(await cache.get(cacheKey), null);
-    if (cached) return normalizeClassification(cached, fallback);
+    if (cached) return cached;
 
-    const recent = String((await cache.get('ai_recent_context')) || '').slice(-800);
+    const recent = String((await cache.get('ai_recent_context')) || '').slice(-1000);
+    const roster = parseObject(await cache.get('ai_character_roster_v2'), {});
+    const rosterList = Object.values(roster).slice(-40);
     const prompt = [
-      '你是中文小说朗读的角色分类器。',
-      '判断“当前朗读片段”主要是旁白还是某个角色的对白；若是对白，推断说话人的称呼、性别和年龄层。',
-      '只返回一个 JSON 对象，不要解释，也不要改写原文。',
-      '固定字段：',
-      '{"type":"narrator或dialogue","speaker":"角色称呼；不确定写未命名角色","gender":"male或female或unknown","age":"child或teen或young或middle或senior或unknown","confidence":0到1}',
-      '判断规则：以当前片段为主，前文只用于消歧；无法确认时必须填 unknown，不要编造姓名。',
+      '你是中文小说的配音导演。文本已经被程序严格拆成旁白和对白，旁白无需处理。',
+      '请判断每条对白是谁说的，并推断性别和年龄层。相同角色必须始终使用完全相同的 speaker 名称。',
+      '优先从已有角色表中选择；原文没有姓名时，可使用稳定称呼，例如“母亲”“少年”“店主”，不要每句创造新角色。',
+      '只返回严格 JSON：',
+      '{"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","confidence":0.0}]}',
       '',
-      '最近前文：',
-      recent || '无',
-      '',
-      '当前朗读片段：',
-      String(text || '').slice(0, 1800)
+      '已有角色表：' + JSON.stringify(rosterList),
+      '最近前文：' + (recent || '无'),
+      '当前段落：' + String(text || '').slice(0, 2600),
+      '待识别对白：' + JSON.stringify(dialogues.map(item => ({
+        id: item.id,
+        before: item.before,
+        text: item.text,
+        after: item.after
+      })))
     ].join('\n');
 
     const body = {
@@ -269,7 +357,7 @@
       temperature: 0,
       response_format: {type: 'json_object'},
       messages: [
-        {role: 'system', content: '你只输出严格 JSON。'},
+        {role: 'system', content: '你只输出严格 JSON，保持角色名称稳定。'},
         {role: 'user', content: prompt}
       ]
     };
@@ -277,52 +365,77 @@
     try {
       const response = await http.Post(
         normalizeEndpoint(settings.aiEndpoint),
-        {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + settings.aiKey
-        },
+        {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + settings.aiKey},
         JSON.stringify(body),
         'application/json',
         true
       );
-
       if (!response || Number(response.statusCode || 200) >= 400) {
         throw new Error('AI HTTP ' + (response ? response.statusCode : '无响应'));
       }
 
-      const payload = parseObject(response.data || response.body || response, {});
+      const payload = parseObject(response.data || response, {});
       const content = payload.choices && payload.choices[0] && payload.choices[0].message
         ? payload.choices[0].message.content
         : payload.output_text;
       const parsed = parseObject(stripJsonFence(content), null);
-      if (!parsed) throw new Error('AI 返回内容不是 JSON');
+      if (!parsed || !Array.isArray(parsed.lines)) throw new Error('AI 返回缺少 lines');
 
-      const result = normalizeClassification(parsed, fallback);
-      await cache.set(cacheKey, JSON.stringify(result));
-      return result;
+      const profiles = {};
+      for (const item of dialogues) {
+        const line = parsed.lines.find(value => Number(value.id) === item.id) || {};
+        const profile = normalizeDialogueProfile(line, fallbacks[item.id]);
+        profiles[item.id] = profile;
+        if (profile.speaker && profile.speaker !== '未命名角色') {
+          roster[profile.speaker] = {
+            speaker: profile.speaker,
+            gender: profile.gender,
+            age: profile.age
+          };
+        }
+      }
+
+      const rosterKeys = Object.keys(roster);
+      if (rosterKeys.length > 60) {
+        rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
+      }
+      await cache.set('ai_character_roster_v2', JSON.stringify(roster));
+      await cache.set(cacheKey, JSON.stringify(profiles));
+      return profiles;
     } catch (error) {
       await flutterBridge.log('AI角色识别失败，改用本地判断：' + error.message);
-      return fallback;
+      return fallbacks;
     }
   }
 
-  function pickFromPool(profile) {
+  function voicePool(profile) {
     const gender = VOICE_POOLS[profile.gender] ? profile.gender : 'unknown';
     const age = VOICE_POOLS[gender][profile.age] ? profile.age : 'unknown';
-    const pool = VOICE_POOLS[gender][age];
-    return pool[parseInt(hashText(profile.speaker || '角色'), 36) % pool.length];
+    return VOICE_POOLS[gender][age];
   }
 
   async function resolveVoice(profile, settings) {
     if (profile.type !== 'dialogue') return settings.narratorVoice;
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map'), {});
-    const identity = [profile.speaker, profile.gender, profile.age].join('|');
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v2'), {});
+    const identity = profile.speaker === '未命名角色'
+      ? [profile.speaker, profile.gender, profile.age].join('|')
+      : profile.speaker;
     if (voiceMap[identity]) return voiceMap[identity];
 
-    const voice = pickFromPool(profile);
+    const pool = voicePool(profile);
+    const used = Object.values(voiceMap);
+    const start = parseInt(hashText(identity || '角色'), 36) % pool.length;
+    let voice = pool[start];
+    for (let offset = 0; offset < pool.length; offset++) {
+      const candidate = pool[(start + offset) % pool.length];
+      if (!used.includes(candidate)) {
+        voice = candidate;
+        break;
+      }
+    }
     voiceMap[identity] = voice;
-    await cache.set('ai_speaker_voice_map', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v2', JSON.stringify(voiceMap));
     return voice;
   }
 
@@ -352,22 +465,115 @@
     return {method: 'get', url: url, headers: {}};
   }
 
+  function base64ToBytes(value) {
+    const binary = atob(String(value || '').replace(/\s/g, ''));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = '';
+    const size = 0x8000;
+    for (let i = 0; i < bytes.length; i += size) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + size));
+    }
+    return btoa(binary);
+  }
+
+  function stripId3(bytes) {
+    if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) return bytes;
+    const size = (bytes[6] << 21) | (bytes[7] << 14) | (bytes[8] << 7) | bytes[9];
+    const offset = Math.min(bytes.length, size + 10);
+    return bytes.subarray(offset);
+  }
+
+  function concatAudio(parts) {
+    const cleaned = parts.map((part, index) => index === 0 ? part : stripId3(part));
+    const total = cleaned.reduce((sum, part) => sum + part.length, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const part of cleaned) {
+      output.set(part, offset);
+      offset += part.length;
+    }
+    return output;
+  }
+
+  async function fetchAudioPart(item, speechRate, settings) {
+    const request = buildProxyRequest(item.text, speechRate, item.voice, item.profile, settings);
+    const response = await http.Get(request.url, {}, true);
+    if (!response || Number(response.statusCode || 200) >= 400 || !response.body) {
+      throw new Error('微软音频请求失败');
+    }
+    return base64ToBytes(response.body);
+  }
+
+  async function buildMultiVoiceRequest(rendered, speechRate, settings, originalText) {
+    const merged = [];
+    for (const item of rendered) {
+      if (!item.text) continue;
+      const previous = merged[merged.length - 1];
+      if (previous && previous.voice === item.voice && pitchFor(previous.profile) === pitchFor(item.profile)) {
+        previous.text += item.text;
+      } else {
+        merged.push({...item});
+      }
+    }
+
+    if (merged.length === 1) {
+      return buildProxyRequest(merged[0].text, speechRate, merged[0].voice, merged[0].profile, settings);
+    }
+
+    try {
+      const parts = [];
+      for (const item of merged) parts.push(await fetchAudioPart(item, speechRate, settings));
+      return {
+        method: 'data',
+        url: '',
+        headers: {},
+        body: bytesToBase64(concatAudio(parts))
+      };
+    } catch (error) {
+      await flutterBridge.log('多角色音频合并失败，整段改用旁白：' + error.message);
+      const narrator = {type: 'narrator', speaker: '旁白', gender: 'unknown', age: 'unknown'};
+      return buildProxyRequest(originalText, speechRate, settings.narratorVoice, narrator, settings);
+    }
+  }
+
   // 阅读 App 调用的核心入口，不可删除或改名。
   async function getttsurl(speakText, speechRate) {
     const text = String(speakText || '').trim();
     const settings = await readSettings();
-    const profile = await classifyWithAI(text, settings);
-    const voice = await resolveVoice(profile, settings);
+    const segments = splitSpeechSegments(text);
+    const dialogueProfiles = await analyzeDialoguesWithAI(text, segments, settings);
+    const rendered = [];
+    let dialogueId = 0;
+
+    for (const segment of segments) {
+      let profile;
+      if (segment.type === 'dialogue') {
+        dialogueId += 1;
+        profile = dialogueProfiles[dialogueId] || {
+          type: 'dialogue', speaker: '未命名角色', gender: 'unknown', age: 'unknown'
+        };
+      } else {
+        profile = {type: 'narrator', speaker: '旁白', gender: 'unknown', age: 'unknown'};
+      }
+      rendered.push({
+        text: segment.text,
+        profile: profile,
+        voice: await resolveVoice(profile, settings)
+      });
+    }
 
     const recent = String((await cache.get('ai_recent_context')) || '');
-    await cache.set('ai_recent_context', (recent + '\n' + text).slice(-800));
-
-    const request = buildProxyRequest(text, speechRate, voice, profile, settings);
+    await cache.set('ai_recent_context', (recent + '\n' + text).slice(-1000));
 
     await flutterBridge.log(
-      'AI配音：' + profile.speaker + ' / ' + profile.gender + ' / ' + profile.age + ' / ' + voice
+      '本段配音：' + rendered.map(item => item.profile.speaker + '=' + item.voice).join('，')
     );
-    return JSON.stringify(request);
+    return JSON.stringify(await buildMultiVoiceRequest(rendered, speechRate, settings, text));
   }
 
   async function setAiEnabled(enabled) {
@@ -376,7 +582,8 @@
   }
 
   async function clearRoleCache() {
-    await cache.remove('ai_speaker_voice_map');
+    await cache.remove('ai_speaker_voice_map_v2');
+    await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_recent_context');
     await flutterBridge.showToast('角色和上下文缓存已清空');
   }
