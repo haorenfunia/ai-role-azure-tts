@@ -133,6 +133,7 @@
   const AI_ANALYSIS_TIMEOUT = 14000;
   const ANALYSIS_BATCH_DELAY = 15;
   const MAX_ANALYSIS_BATCH_ITEMS = 3;
+  const MAX_CONCURRENT_ANALYSIS_BATCHES = 3;
 
   const VOICE_POOLS = {
     female: {
@@ -1059,23 +1060,40 @@
   // 把轻阅时光同时预取的小段合并成一次 AI 请求，减少排队和超时。
   let pendingRoleBatch = [];
   let roleBatchTimer = null;
-  let roleBatchBusy = false;
+  let activeRoleBatches = 0;
+  const rolePreparationInFlight = {};
 
   function scheduleRolePreparation(text, segments, settings) {
-    return new Promise((resolve, reject) => {
+    const requestKey = hashText(text + '|' + aiFingerprint(settings));
+    if (rolePreparationInFlight[requestKey]) return rolePreparationInFlight[requestKey];
+
+    const preparation = new Promise((resolve, reject) => {
       pendingRoleBatch.push({text: text, segments: segments, settings: settings, resolve: resolve, reject: reject});
-      if (!roleBatchBusy && !roleBatchTimer) {
+      if (!roleBatchTimer) {
         roleBatchTimer = setTimeout(flushRoleBatch, settings.aiEnabled ? ANALYSIS_BATCH_DELAY : 0);
       }
     });
+    rolePreparationInFlight[requestKey] = preparation;
+    const clearRequest = () => delete rolePreparationInFlight[requestKey];
+    preparation.then(clearRequest, clearRequest);
+    return preparation;
   }
 
   async function flushRoleBatch() {
     roleBatchTimer = null;
-    if (roleBatchBusy || !pendingRoleBatch.length) return;
-    roleBatchBusy = true;
+    if (!pendingRoleBatch.length) return;
+    if (activeRoleBatches >= MAX_CONCURRENT_ANALYSIS_BATCHES) {
+      roleBatchTimer = setTimeout(flushRoleBatch, 20);
+      return;
+    }
+    activeRoleBatches += 1;
     // 只合并少量相邻预取段，避免把整章塞给 AI 后变慢或串错角色。
     const batch = pendingRoleBatch.splice(0, MAX_ANALYSIS_BATCH_ITEMS);
+    // 后面的预取段可同时识别，不再排队累计 14、28、42 秒。
+    if (pendingRoleBatch.length && !roleBatchTimer &&
+      activeRoleBatches < MAX_CONCURRENT_ANALYSIS_BATCHES) {
+      roleBatchTimer = setTimeout(flushRoleBatch, 0);
+    }
 
     try {
       const combinedText = batch.map(item => item.text).join('\n');
@@ -1119,9 +1137,9 @@
     } catch (error) {
       batch.forEach(item => item.reject(error));
     } finally {
-      roleBatchBusy = false;
+      activeRoleBatches -= 1;
       if (pendingRoleBatch.length && !roleBatchTimer) {
-        roleBatchTimer = setTimeout(flushRoleBatch, ANALYSIS_BATCH_DELAY);
+        roleBatchTimer = setTimeout(flushRoleBatch, 0);
       }
     }
   }
