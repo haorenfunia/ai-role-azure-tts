@@ -669,6 +669,13 @@
       const cand = match[1];
       if (!speechAdverb.test(cand)) speaker = cand;
     }
+    // 兼容“姓名+动作+：”引出引号（如“张羽垂着眼：”“白真真抬起头：”）。
+    if (!speaker || speaker === '未命名角色') {
+      const colonMatch = value.match(/([\u4e00-\u9fa5]{2,4})(?:垂着眼|笑了笑|点了点头|叹了口气|顿了顿|皱皱眉|抬起头|看向|看着他|看着她|看过来|回过神)[，。、\s]*[:：]/);
+      if (colonMatch && !speechAdverb.test(colonMatch[1]) && sanitizeSpeaker(colonMatch[1]) !== '未命名角色') {
+        speaker = colonMatch[1];
+      }
+    }
     if (/解释|回应|补充|电话|一头|接着|继续/.test(speaker)) return '未命名角色';
     if (/^(她|女孩|姑娘|女子)$/.test(speaker)) return '女性角色';
     if (/^(他|男孩|男人|男子)$/.test(speaker)) return '男性角色';
@@ -698,23 +705,26 @@
     const afterClause = after.split(/[。！？；]/)[0] || '';
     const beforeParts = before.split(/[。！？；]/);
     const beforeClause = beforeParts[beforeParts.length - 1] || '';
-    const afterSpeaker = inferSpeaker(afterClause);
-    const nearbySpeaker = afterSpeaker !== '未命名角色'
-      ? afterSpeaker
-      : inferSpeaker(beforeClause);
+    const beforeSpeaker = inferSpeaker(beforeClause);
+    // 本句说话人优先取紧邻其前的小句（“X说道：/X垂着眼：”），
+    // 取不到才回退到其后的叙述，避免被下一句的说话人错误归属。
+    const nearbySpeaker = beforeSpeaker !== '未命名角色'
+      ? beforeSpeaker
+      : inferSpeaker(afterClause);
 
     // 代词/称谓线索判断不出性别时，用中文姓名特征推测（如“白真真”→女性）。
-    if (gender === 'unknown' && nearbySpeaker && !/未命名|角色/.test(nearbySpeaker)) {
-      const nameGender = guessNameGender(nearbySpeaker);
-      if (nameGender !== 'unknown') gender = nameGender;
-    }
+    const genderFromName = gender === 'unknown' && nearbySpeaker && !/未命名|角色/.test(nearbySpeaker)
+      ? guessNameGender(nearbySpeaker) : 'unknown';
+    if (gender === 'unknown' && genderFromName !== 'unknown') gender = genderFromName;
 
     return {
       type: 'dialogue',
       speaker: sanitizeSpeaker(nearbySpeaker),
       gender: gender,
       age: age,
-      confidence: 0.35
+      confidence: 0.35,
+      // 性别已有确凿依据（代词或姓名特征）时，禁止被“延续上一句”覆盖。
+      _genderLock: gender !== 'unknown'
     };
   }
 
@@ -809,7 +819,8 @@
 
   function hasSpeakerCue(item) {
     const context = String(item.before || '') + ' ' + String(item.after || '');
-    return /(?:说|问|喊|答|叫|道|解释|回应|补充|嘀咕|叹气|开口|接着|继续)/.test(context);
+    // 说话动词，或“姓名+动作+：”引出引号（如“张羽垂着眼：”）也算说话线索。
+    return /(?:说|问|喊|答|叫|道|解释|回应|补充|嘀咕|叹气|开口|接着|继续)|[\u4e00-\u9fa5]{1,4}(?:垂着眼|笑了笑|点了点头|叹了口气|顿了顿|皱皱眉|抬起头|看着他|看着她|看向)[，。、]*[:：]/.test(context);
   }
 
   function isGenericSpeaker(speaker) {
@@ -899,14 +910,14 @@
       }
     }
     const cacheContext = previousProfile ? previousProfile.speaker : '';
-    const cacheKey = 'ai_cast_v11_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v12_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v8'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
@@ -1006,7 +1017,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v8', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v9', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -1051,7 +1062,7 @@
       return narratorOverride || settings.narratorVoice;
     }
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v8'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
@@ -1073,13 +1084,13 @@
       }
     }
     voiceMap[identity] = {voice: voice, gender: profile.gender, age: profile.age};
-    await cache.set('ai_speaker_voice_map_v8', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v9', JSON.stringify(voiceMap));
     return voice;
   }
 
   // 手动给某个角色指定音色，写入 voice map 并标记为 override（最高优先级）。
   async function switchVoice(identity, voice) {
-    const key = 'ai_speaker_voice_map_v8';
+    const key = 'ai_speaker_voice_map_v9';
     const voiceMap = parseObject(await cache.get(key), {});
     const existing = voiceMap[identity];
     const savedGender = existing && typeof existing === 'object' ? (existing.gender || 'unknown') : 'unknown';
@@ -1094,7 +1105,7 @@
 
   // 移除某个角色的手动指定，恢复自动分配。
   async function resetVoice(identity) {
-    const key = 'ai_speaker_voice_map_v8';
+    const key = 'ai_speaker_voice_map_v9';
     const voiceMap = parseObject(await cache.get(key), {});
     const entry = voiceMap[identity];
     if (entry && typeof entry === 'object') {
@@ -1126,7 +1137,7 @@
 
   // 生成音色管理面板的 JSON UI（从 voice map 列出各角色当前音色并提供切换）。
   async function buildVoiceManagerUI() {
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v8'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
     const ui = [
       {name: '配音音色管理', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}},
       {name: '旁白音色：' + voiceLabel(await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice), type: 'text'}
@@ -1393,11 +1404,12 @@
               before: before && before.type === 'narrator' ? before.text : '',
               after: after && after.type === 'narrator' ? after.text : ''
             };
-            // 只有当本条没有明确说话人名（泛称）时才沿用上一条；已点出具体
-            // 姓名（如“白真真”）且与上一条不同时，尊重该姓名及其性别音色。
+            // 仅当本条无明确说话人名、且性别也无可信依据时，才沿用上一条，
+            // 避免把真正的说话人（如白真真/女）并成上一句不同角色（张羽/男）。
             const currentHasConcreteName = profile.speaker && !isGenericSpeaker(profile.speaker);
+            const genderLocked = !!profile._genderLock;
             if (lastFinalizedDialogueProfile && !hasSpeakerCue(boundaryContext) &&
-              !currentHasConcreteName) {
+              !currentHasConcreteName && !genderLocked) {
               profile = {
                 ...profile,
                 speaker: lastFinalizedDialogueProfile.speaker,
@@ -1466,10 +1478,10 @@
     lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
-    await cache.remove('ai_speaker_voice_map_v8');
+    await cache.remove('ai_speaker_voice_map_v9');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
-    await cache.remove('ai_character_roster_v8');
+    await cache.remove('ai_character_roster_v9');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await cache.remove('ai_chapter_memory_v4');
