@@ -449,5 +449,13 @@
   }
 
   async function login() {}
+
+  // 显式挂到 window，兼容使用反射查找入口函数的阅读 App WebView。
+  window.getttsurl = getttsurl;
+  window.getloginurl = getloginurl;
+  window.login = login;
+  window.setAiEnabled = setAiEnabled;
+  window.setTtsMode = setTtsMode;
+  window.clearRoleCache = clearRoleCache;
 </script>
 </html>
