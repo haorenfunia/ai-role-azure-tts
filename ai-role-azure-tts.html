@@ -138,19 +138,19 @@
   const VOICE_POOLS = {
     female: {
       child: ['zh-CN-XiaoshuangNeural'],
-      teen: ['zh-CN-XiaoyiNeural'],
-      young: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaohanNeural'],
-      middle: ['zh-CN-XiaomoNeural', 'zh-CN-XiaohanNeural'],
-      senior: ['zh-CN-XiaomoNeural', 'zh-CN-XiaoqiuNeural'],
-      unknown: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaohanNeural']
+      teen: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaomengNeural', 'zh-CN-XiaoyanNeural', 'zh-CN-XiaoniNeural'],
+      young: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-XiaohanNeural', 'zh-CN-XiaomengNeural', 'zh-CN-XiaoyanNeural', 'zh-CN-XiaozhenNeural', 'zh-CN-XiaobeiNeural', 'zh-CN-XiaoniNeural', 'zh-CN-XiaoxuanNeural'],
+      middle: ['zh-CN-XiaomoNeural', 'zh-CN-XiaohanNeural', 'zh-CN-XiaoruiNeural', 'zh-CN-XiaozhenNeural', 'zh-CN-XiaobeiNeural', 'zh-CN-XiaoxuanNeural'],
+      senior: ['zh-CN-XiaomoNeural', 'zh-CN-XiaoqiuNeural', 'zh-CN-XiaoruiNeural', 'zh-CN-XiaobeiNeural'],
+      unknown: ['zh-CN-XiaoyiNeural', 'zh-CN-XiaohanNeural', 'zh-CN-XiaomengNeural', 'zh-CN-XiaoyanNeural', 'zh-CN-XiaozhenNeural', 'zh-CN-XiaoniNeural', 'zh-CN-XiaoxuanNeural']
     },
     male: {
       child: ['zh-CN-YunxiaNeural'],
-      teen: ['zh-CN-YunxiNeural'],
-      young: ['zh-CN-YunxiNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunzeNeural'],
-      middle: ['zh-CN-YunzeNeural', 'zh-CN-YunyeNeural', 'zh-CN-YunfengNeural'],
-      senior: ['zh-CN-YunyeNeural', 'zh-CN-YunzeNeural'],
-      unknown: ['zh-CN-YunxiNeural', 'zh-CN-YunzeNeural']
+      teen: ['zh-CN-YunxiNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunhaoNeural', 'zh-CN-YunjianNeural'],
+      young: ['zh-CN-YunxiNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunzeNeural', 'zh-CN-YunhaoNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunjianNeural', 'zh-CN-YunyangNeural'],
+      middle: ['zh-CN-YunzeNeural', 'zh-CN-YunyeNeural', 'zh-CN-YunfengNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunjianNeural', 'zh-CN-YunyangNeural'],
+      senior: ['zh-CN-YunyeNeural', 'zh-CN-YunzeNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunjianNeural', 'zh-CN-YunyangNeural'],
+      unknown: ['zh-CN-YunxiNeural', 'zh-CN-YunzeNeural', 'zh-CN-YunhaoNeural', 'zh-CN-YunjieNeural', 'zh-CN-YunjianNeural', 'zh-CN-YunyangNeural']
     },
     unknown: {
       child: ['zh-CN-XiaoyouNeural', 'zh-CN-YunxiaNeural'],
@@ -610,10 +610,11 @@
 
   function inferSpeaker(context) {
     const value = String(context || '');
-    const pattern = /([\u4e00-\u9fa5]{1,4})(?:急忙|轻声|低声|大声|冷冷地|笑着|哭着|突然)?(?:说道|说|问道|问|喊道|喊|答道|答|叫道|叫|道)/g;
+    const pattern = /(?:^|[，。！？；、\s])([\u4e00-\u9fa5]{1,4}?)(?:急忙|轻声|低声|大声|冷冷地|笑着|哭着|突然|认真|温和地|沉声|缓缓|平静地)?(?:说道|说|问道|问|喊道|喊|答道|答|叫道|叫)/g;
     let match;
     let speaker = '';
     while ((match = pattern.exec(value))) speaker = match[1];
+    if (/解释|回应|补充|电话|一头|接着|继续/.test(speaker)) return '未命名角色';
     if (/^(她|女孩|姑娘|女子)$/.test(speaker)) return '女性角色';
     if (/^(他|男孩|男人|男子)$/.test(speaker)) return '男性角色';
     return speaker || '未命名角色';
@@ -638,9 +639,18 @@
     else if (/中年|大叔|阿姨|父亲|母亲/.test(context)) age = 'middle';
     else age = 'young';
 
+    // 只看紧邻当前引号的小句，避免把上一句的“某某说道”套到下一位角色身上。
+    const afterClause = after.split(/[。！？；]/)[0] || '';
+    const beforeParts = before.split(/[。！？；]/);
+    const beforeClause = beforeParts[beforeParts.length - 1] || '';
+    const afterSpeaker = inferSpeaker(afterClause);
+    const nearbySpeaker = afterSpeaker !== '未命名角色'
+      ? afterSpeaker
+      : inferSpeaker(beforeClause);
+
     return {
       type: 'dialogue',
-      speaker: inferSpeaker(after + ' ' + before),
+      speaker: nearbySpeaker,
       gender: gender,
       age: age,
       confidence: 0.35
@@ -672,8 +682,8 @@
   function stabilizeCharacterProfile(profile, line, roster) {
     const known = roster[profile.speaker];
     if (known) {
-      if (profile.gender === 'unknown' && known.gender) profile.gender = known.gender;
-      if (profile.age === 'unknown' && known.age) profile.age = known.age;
+      if (known.gender && known.gender !== 'unknown') profile.gender = known.gender;
+      if (known.age && known.age !== 'unknown') profile.age = known.age;
     }
     if (profile.age === 'child' && !(known && known.age === 'child') &&
       !hasStrictChildEvidence(line.age_evidence || line['年龄依据'])) {
@@ -682,12 +692,24 @@
     return profile;
   }
 
+  function canonicalSpeakerName(speaker, roster) {
+    const name = String(speaker || '').trim();
+    if (!name || roster[name]) return name;
+    const base = name.replace(/(?:先生|女士|小姐|老师|医生|主任|经理|老板|同学)$/g, '');
+    if (base && roster[base]) return base;
+    const matches = Object.keys(roster).filter(existing => {
+      const existingBase = existing.replace(/(?:先生|女士|小姐|老师|医生|主任|经理|老板|同学)$/g, '');
+      return base.length >= 2 && existingBase === base;
+    });
+    return matches.length === 1 ? matches[0] : name;
+  }
+
   function isChapterHeading(text) {
     return /^\s*(?:第[零一二三四五六七八九十百千万两\d]+[章节回卷]|序章|楔子|尾声|番外)/.test(String(text || ''));
   }
 
   async function readChapterMemory(text) {
-    let memory = parseObject(await cache.get('ai_chapter_memory_v3'), {});
+    let memory = parseObject(await cache.get('ai_chapter_memory_v4'), {});
     if (!memory || typeof memory !== 'object' || isChapterHeading(text)) memory = {};
     return {
       text: String(memory.text || '').slice(-30000),
@@ -740,7 +762,7 @@
       }
       memory.dialogues = memory.dialogues.slice(-80);
     }
-    await cache.set('ai_chapter_memory_v3', JSON.stringify(memory));
+    await cache.set('ai_chapter_memory_v4', JSON.stringify(memory));
   }
 
   async function analyzeDialoguesWithAI(text, segments, settings) {
@@ -789,7 +811,7 @@
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v3'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v4'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
@@ -859,6 +881,11 @@
       for (const item of dialogues) {
         const line = parsed.lines.find(value => Number(value.id) === item.id) || {};
         let profile = normalizeDialogueProfile(line, fallbacks[item.id]);
+        const explicitSpeaker = fallbacks[item.id] && fallbacks[item.id].speaker;
+        if (explicitSpeaker && !isGenericSpeaker(explicitSpeaker)) {
+          profile.speaker = explicitSpeaker;
+        }
+        profile.speaker = canonicalSpeakerName(profile.speaker, roster);
         profile = stabilizeCharacterProfile(profile, line, roster);
         profile = keepPreviousSpeaker(profile, line, item, previousProfile, roster);
         profiles[item.id] = profile;
@@ -876,7 +903,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v3', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v4', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -900,17 +927,34 @@
     return VOICE_POOLS[gender][age];
   }
 
+  function voiceMatchesProfile(voice, profile) {
+    if (!voice) return false;
+    const gender = profile.gender === 'male' || profile.gender === 'female'
+      ? profile.gender
+      : 'unknown';
+    if (gender !== 'unknown') {
+      const genderVoices = Object.values(VOICE_POOLS[gender]).flat();
+      if (!genderVoices.includes(voice)) return false;
+    }
+    const childVoices = [...VOICE_POOLS.female.child, ...VOICE_POOLS.male.child];
+    if (profile.age === 'child') return childVoices.includes(voice);
+    if (profile.age !== 'unknown' && childVoices.includes(voice)) return false;
+    return true;
+  }
+
   async function resolveVoice(profile, settings) {
     if (profile.type !== 'dialogue') return settings.narratorVoice;
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v3'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v4'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
-    if (voiceMap[identity]) return voiceMap[identity];
+    const saved = voiceMap[identity];
+    const savedVoice = typeof saved === 'string' ? saved : saved && saved.voice;
+    if (voiceMatchesProfile(savedVoice, profile)) return savedVoice;
 
     const pool = voicePool(profile);
-    const used = Object.values(voiceMap);
+    const used = Object.values(voiceMap).map(item => typeof item === 'string' ? item : item && item.voice).filter(Boolean);
     const start = parseInt(hashText(identity || '角色'), 36) % pool.length;
     let voice = pool[start];
     for (let offset = 0; offset < pool.length; offset++) {
@@ -920,8 +964,8 @@
         break;
       }
     }
-    voiceMap[identity] = voice;
-    await cache.set('ai_speaker_voice_map_v3', JSON.stringify(voiceMap));
+    voiceMap[identity] = {voice: voice, gender: profile.gender, age: profile.age};
+    await cache.set('ai_speaker_voice_map_v4', JSON.stringify(voiceMap));
     return voice;
   }
 
@@ -1204,10 +1248,13 @@
     lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
+    await cache.remove('ai_speaker_voice_map_v4');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
+    await cache.remove('ai_character_roster_v4');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
+    await cache.remove('ai_chapter_memory_v4');
     await flutterBridge.showToast('角色和上下文缓存已清空');
   }
 
