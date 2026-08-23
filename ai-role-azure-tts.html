@@ -404,8 +404,8 @@
     const lastError = await cache.get('ai_last_read_error');
     const rawPreview = await cache.get('ai_last_raw_preview');
     const stats = parseObject(await cache.get('ai_run_stats'), {ok: 0, timeout: 0});
-    const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v10'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v10'), {});
     const eventLog = parseObject(await cache.get('ai_event_log'), []);
     const narrator = await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice;
     const uiMode = await cache.get('ai_ui_mode') || 'settings';
@@ -886,16 +886,18 @@
   }
 
   // 过滤明显不是人名的 speaker（AI 或本地判断把短语误认成说话人时回退为未命名）。
-  const NON_NAME_PATTERN = /(说道|说道|道|说|问|喊|答|叫|叹|感叹|坦言|解释|回应|补充|继续|接着|突然|随即|于是|然后|但是|因为|所以|只见|这时|此刻|理所当然|理应|应当|应该|自然|似乎|仿佛|好像|一边|一面|顿了顿|沉默|片刻|良久|低声|轻声|大声|高声|笑着|哭着|气愤|激动|淡淡|冷冷|平静|缓缓|焦急|慌张|急切|认真|温和|轻声地|低声道|如此|一个|一位|这个|那个|只见|来了|走去|走来|说完|说罢|说罢)/;
+  const NON_NAME_PATTERN = /(说道|说道|道|说|问|喊|答|叫|叹|感叹|坦言|解释|回应|补充|继续|接着|突然|随即|于是|然后|但是|因为|所以|只见|这时|此刻|理所当然|理应|应当|应该|自然|似乎|仿佛|好像|一边|一面|顿了顿|沉默|片刻|良久|低声|轻声|大声|高声|笑着|哭着|气愤|激动|淡淡|冷冷|平静|缓缓|焦急|慌张|急切|认真|温和|轻声地|低声道|如此|一个|一位|这个|那个|只见|来了|走去|走来|说完|说罢|开口|点评|心中|好奇|暗自|忽然|猛然|当下|随即)/;
+  // 姓名末字若为动作/表情/语气字，多半是短语误抓。
+  const NON_NAME_ENDING = /[叹道说问喊答叫评点奇暗想看望笑谈议解释询斥责咕囔嘟嚷叹着怒瞪皱眉咽气哼]/;
   function sanitizeSpeaker(speaker) {
     const value = String(speaker || '').trim();
     if (!value || isGenericSpeaker(value)) return '未命名角色';
-    // 超过4个汉字基本不是人名。
-    if (value.length > 4) return '未命名角色';
+    // 含数字（如“125瓜”）、超过4个汉字，基本不是人名。
+    if (/\d/.test(value) || value.length > 4) return '未命名角色';
     // 含说话动词/副词/连词等明显非人名成分，或整个就是语气词。
     if (NON_NAME_PATTERN.test(value)) return '未命名角色';
-    // 末字为常见动词性字（叹/道/说/问等）判定为误抓。
-    if (/[叹道说问喊答叫]$/.test(value)) return '未命名角色';
+    // 末字为常见动词性/表情字（叹/道/说/点评/奇/暗等）判定为误抓。
+    if (NON_NAME_ENDING.test(value[value.length - 1])) return '未命名角色';
     return value;
   }
 
@@ -1017,14 +1019,14 @@
       }
     }
     const cacheContext = previousProfile ? previousProfile.speaker : '';
-    const cacheKey = 'ai_cast_v12_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v13_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       await appLog('命中AI缓存(' + cacheKey.slice(0, 12) + ')，直接使用已识别结果');
       return cached;
     }
-    const roster = parseObject(await cache.get('ai_character_roster_v9'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v10'), {});
     const knownCount = Object.keys(roster).filter(k => roster[k] && roster[k].speaker).length;
     await appLog('未命中缓存，发起AI分析(共' + dialogues.length + '句，携带已知角色' + knownCount + '个)');
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
@@ -1126,7 +1128,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v9', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v10', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -1194,7 +1196,7 @@
       return narratorOverride || settings.narratorVoice;
     }
 
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v10'), {});
     const identity = profile.speaker === '未命名角色'
       ? [profile.speaker, profile.gender, profile.age].join('|')
       : profile.speaker;
@@ -1216,13 +1218,13 @@
       }
     }
     voiceMap[identity] = {voice: voice, gender: profile.gender, age: profile.age};
-    await cache.set('ai_speaker_voice_map_v9', JSON.stringify(voiceMap));
+    await cache.set('ai_speaker_voice_map_v10', JSON.stringify(voiceMap));
     return voice;
   }
 
   // 手动给某个角色指定音色，写入 voice map 并标记为 override（最高优先级）。
   async function switchVoice(identity, voice) {
-    const key = 'ai_speaker_voice_map_v9';
+    const key = 'ai_speaker_voice_map_v10';
     const voiceMap = parseObject(await cache.get(key), {});
     const existing = voiceMap[identity];
     const savedGender = existing && typeof existing === 'object' ? (existing.gender || 'unknown') : 'unknown';
@@ -1237,7 +1239,7 @@
 
   // 移除某个角色的手动指定，恢复自动分配。
   async function resetVoice(identity) {
-    const key = 'ai_speaker_voice_map_v9';
+    const key = 'ai_speaker_voice_map_v10';
     const voiceMap = parseObject(await cache.get(key), {});
     const entry = voiceMap[identity];
     if (entry && typeof entry === 'object') {
@@ -1269,7 +1271,7 @@
 
   // 生成音色管理面板的 JSON UI（从 voice map 列出各角色当前音色并提供切换）。
   async function buildVoiceManagerUI() {
-    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v9'), {});
+    const voiceMap = parseObject(await cache.get('ai_speaker_voice_map_v10'), {});
     const ui = [
       {name: '配音音色管理', type: 'button', style: {layout_flexBasisPercent: 1.0, disabled: true}},
       {name: '旁白音色：' + voiceLabel(await cache.get('ai_narrator_voice_override') || DEFAULTS.narratorVoice), type: 'text'}
@@ -1618,14 +1620,17 @@
     lastFinalizedDialogueProfile = null;
     await cache.remove('ai_speaker_voice_map_v2');
     await cache.remove('ai_speaker_voice_map_v3');
-    await cache.remove('ai_speaker_voice_map_v9');
+    await cache.remove('ai_speaker_voice_map_v10');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
-    await cache.remove('ai_character_roster_v9');
+    await cache.remove('ai_character_roster_v10');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await cache.remove('ai_chapter_memory_v4');
-    await flutterBridge.showToast('角色和上下文缓存已清空');
+    await cache.remove('ai_event_log');
+    await cache.remove('ai_run_stats');
+    await cache.remove('ai_ai_backup');
+    await flutterBridge.showToast('角色、音色、日志缓存已清空');
   }
 
   // 返回非 http 内容时，阅读 App 会把下面的 JSON 显示成设置弹窗。
