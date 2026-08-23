@@ -130,7 +130,8 @@
     proxyEndpoint: 'http://5.45.99.149:8075/tts',
     narratorVoice: 'zh-CN-YunyiMultilingualNeural'
   };
-  const AI_ANALYSIS_TIMEOUT = 15000;
+  const AI_ANALYSIS_MIN_TIMEOUT = 35000;
+  const AI_ANALYSIS_MAX_TIMEOUT = 60000;
   const ANALYSIS_BATCH_DELAY = 15;
 
   const VOICE_POOLS = {
@@ -788,7 +789,18 @@
     }
 
     const roster = parseObject(await cache.get('ai_character_roster_v3'), {});
-    const rosterList = Object.values(roster).slice(-40);
+    // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
+    const rosterList = Object.values(roster).slice(-24).map(item => ({
+      speaker: item.speaker,
+      gender: item.gender,
+      age: item.age
+    }));
+    const compactHistory = dialogueHistory.slice(-4).map(item => ({
+      speaker: item.speaker,
+      gender: item.gender,
+      age: item.age,
+      text: String(item.text || '').slice(0, 80)
+    }));
     const prompt = [
       '你是中文小说的配音导演。文本已经被程序严格拆成旁白和对白，旁白无需处理。',
       '请判断每条对白是谁说的，并推断性别和年龄层。相同角色必须始终使用完全相同的 speaker 名称。',
@@ -802,7 +814,7 @@
       '{"narration":{"emotion":"neutral","intensity":0.3},"lines":[{"id":1,"speaker":"角色名或稳定称呼","gender":"male|female|unknown","age":"child|teen|young|middle|senior|unknown","age_evidence":"原文依据或无","emotion":"neutral","intensity":0.3,"same_as_previous":false,"confidence":0.0}]}',
       '',
       '已有角色表：' + JSON.stringify(rosterList),
-      '最近已确认的对白角色：' + JSON.stringify(dialogueHistory),
+      '最近已确认的对白角色：' + JSON.stringify(compactHistory),
       '当前段落：' + String(text || '').slice(0, 1200),
       '待识别对白：' + JSON.stringify(dialogues.map(item => ({
         id: item.id,
@@ -824,6 +836,11 @@
     };
 
     let lastRawContent = '';
+    // 短段也给模型足够的联网响应时间；对白较多时再逐步增加，避免固定 15 秒误杀。
+    const analysisTimeout = Math.min(
+      AI_ANALYSIS_MAX_TIMEOUT,
+      AI_ANALYSIS_MIN_TIMEOUT + Math.max(0, dialogues.length - 2) * 2500
+    );
     try {
       const parsed = await withTimeout(
         (async () => {
@@ -856,8 +873,8 @@
             normalizePlainAiAnalysis(content, dialogues.length);
           return analysis;
         })(),
-        AI_ANALYSIS_TIMEOUT,
-        'AI分析超过15秒'
+        analysisTimeout,
+        'AI分析超过' + Math.round(analysisTimeout / 1000) + '秒'
       );
       if (!parsed || !parsed.lines.length) throw new Error('AI返回格式无法识别');
 
