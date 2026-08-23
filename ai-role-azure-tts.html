@@ -813,14 +813,14 @@
       }
     }
     const cacheContext = previousProfile ? previousProfile.speaker : '';
-    const cacheKey = 'ai_cast_v8_' + hashText(text + '|' + cacheContext);
+    const cacheKey = 'ai_cast_v9_' + hashText(text + '|' + cacheContext);
     const cached = parseObject(await cache.get(cacheKey), null);
     if (cached) {
       cached._source = 'ai';
       return cached;
     }
 
-    const roster = parseObject(await cache.get('ai_character_roster_v5'), {});
+    const roster = parseObject(await cache.get('ai_character_roster_v6'), {});
     // 只携带角色识别真正需要的字段，避免角色表越积越长拖慢模型。
     const rosterList = Object.values(roster).slice(-12).map(item => ({
       speaker: item.speaker,
@@ -913,7 +913,7 @@
       if (rosterKeys.length > 60) {
         rosterKeys.slice(0, rosterKeys.length - 60).forEach(key => delete roster[key]);
       }
-      await cache.set('ai_character_roster_v5', JSON.stringify(roster));
+      await cache.set('ai_character_roster_v6', JSON.stringify(roster));
       profiles._narration = normalizeProsody(parsed.narration);
       profiles._source = 'ai';
       await cache.set(cacheKey, JSON.stringify(profiles));
@@ -1261,7 +1261,7 @@
     await cache.remove('ai_speaker_voice_map_v4');
     await cache.remove('ai_character_roster_v2');
     await cache.remove('ai_character_roster_v3');
-    await cache.remove('ai_character_roster_v5');
+    await cache.remove('ai_character_roster_v6');
     await cache.remove('ai_recent_context');
     await cache.remove('ai_chapter_memory_v3');
     await cache.remove('ai_chapter_memory_v4');
